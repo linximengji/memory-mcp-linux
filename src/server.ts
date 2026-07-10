@@ -1,3 +1,16 @@
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
+import { trace } from "@opentelemetry/api";
+
+const otelSdk = new NodeSDK({
+  serviceName: "memory-mcp",
+  traceExporter: new OTLPTraceExporter({ url: "http://localhost:4317/v1/traces" }),
+  instrumentations: [new HttpInstrumentation()],
+});
+otelSdk.start();
+const _tracer = trace.getTracer("memory-mcp");
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -61,6 +74,19 @@ const call = (method: string, params: Record<string, unknown>) =>
 const callLong = (method: string, params: Record<string, unknown>) =>
   bridge.call(method, params, 120_000).then(txt);
 
+function toolHandler(name: string, fn: (params: any) => Promise<ToolResult>) {
+  return async (params: any): Promise<ToolResult> => {
+    return _tracer.startActiveSpan(`tool:${name}`, async (span) => {
+      span.setAttribute("tool", name);
+      try {
+        return await fn(params);
+      } finally {
+        span.end();
+      }
+    });
+  };
+}
+
 const logLine = (msg: string) => {
   const ts = new Date().toISOString();
   process.stderr.write(`[${ts}] [server] ${msg}\n`);
@@ -78,55 +104,55 @@ const server = new McpServer({
 server.registerTool(
   "memory_store",
   { description: SCHEMA_NOTE, inputSchema: MemoryStoreSchema.shape },
-  async (params) => call("memory_store", params as Record<string, unknown>)
+  toolHandler("memory_store", async (params) => call("memory_store", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_update",
   { description: "Update an existing memory. Only provided fields are changed.", inputSchema: MemoryUpdateSchema.shape },
-  async (params) => call("memory_update", params as Record<string, unknown>)
+  toolHandler("memory_update", async (params) => call("memory_update", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_recall",
   { description: "Search memories by query. Returns top_k most relevant results with scores.", inputSchema: MemoryRecallSchema.shape },
-  async (params) => call("memory_recall", params as Record<string, unknown>)
+  toolHandler("memory_recall", async (params) => call("memory_recall", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_get",
   { description: "Read a specific memory by its name (kebab-case slug).", inputSchema: MemoryGetSchema.shape },
-  async (params) => call("memory_get", params as Record<string, unknown>)
+  toolHandler("memory_get", async (params) => call("memory_get", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_list",
   { description: "List all memories. Filter by namespace (project module name).", inputSchema: MemoryListSchema.shape },
-  async (params) => call("memory_list", params as Record<string, unknown>)
+  toolHandler("memory_list", async (params) => call("memory_list", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_delete",
   { description: "Delete a memory by name.", inputSchema: MemoryDeleteSchema.shape },
-  async (params) => call("memory_delete", params as Record<string, unknown>)
+  toolHandler("memory_delete", async (params) => call("memory_delete", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_rebuild_index",
   { description: "Rebuild MEMORY.md index from all memory files.", inputSchema: z.object({}).shape },
-  async () => call("memory_rebuild_index", {})
+  toolHandler("memory_rebuild_index", async () => call("memory_rebuild_index", {}))
 );
 
 server.registerTool(
   "memory_review",
   { description: "Apply or dismiss suggestions from the review report. action: 'apply' or 'dismiss'.", inputSchema: MemoryReviewSchema.shape },
-  async (params) => call("memory_review", params as Record<string, unknown>)
+  toolHandler("memory_review", async (params) => call("memory_review", params as Record<string, unknown>))
 );
 
 server.registerTool(
   "memory_cleanup",
   { description: "List or delete low-quality memories. action='list' shows candidates, action='delete' removes them.", inputSchema: MemoryCleanupSchema.shape },
-  async (params) => call("memory_cleanup", params as Record<string, unknown>)
+  toolHandler("memory_cleanup", async (params) => call("memory_cleanup", params as Record<string, unknown>))
 );
 
 const HealthCheckSchema = z.object({
@@ -138,7 +164,7 @@ server.registerTool(
   "memory_health_check",
   { description: "Run memory health check. L1 (structural) runs always; L3 (LLM audit) requires llm_enabled=true.",
     inputSchema: HealthCheckSchema.shape },
-  async (params) => callLong("health_check", { llm_enabled: params.llm_enabled })
+  toolHandler("memory_health_check", async (params) => callLong("health_check", { llm_enabled: params.llm_enabled }))
 );
 
 // --- Code Graph tools ---
@@ -166,31 +192,31 @@ server.registerTool(
   "memory_code_scan",
   { description: "[Trigger: 首次会话、怀疑依赖过时] 扫描25个项目的跨项目运行时依赖。产出 edges.json(HTTP/subprocess/fs依赖) 和 symbols.json(函数/类定义索引)。支持增量。",
     inputSchema: CodeScanSchema.shape },
-  async (params) => {
+  toolHandler("memory_code_scan", async (params) => {
     const args: Record<string, unknown> = {};
     if (params.projects) args.projects_filter = params.projects;
     return callLong("memory_code_scan", args);
-  }
+  })
 );
 
 server.registerTool(
   "memory_trace_impact",
   { description: "[Trigger: 改接口/改函数签名/改文件路径/跨项目重构/删文件前] BFS影响链追踪。传入目标文件(支持 project/rel/path 或绝对路径)，返回所有下游依赖方(项目+文件+距离)。先查此工具再动手改。",
     inputSchema: TraceImpactSchema.shape },
-  async (params) => {
+  toolHandler("memory_trace_impact", async (params) => {
     const args: Record<string, unknown> = { target_file: params.target, max_depth: params.depth };
     return callLong("memory_trace_impact", args);
-  }
+  })
 );
 
 server.registerTool(
   "memory_code_query",
   { description: "[Trigger: 搜函数定义/查谁在调用/找文件归属] 查询符号。type=symbol→搜定义位置; type=consumer→查谁在调用该符号; type=exporter→按文件聚合导出者。",
     inputSchema: CodeQuerySchema.shape },
-  async (params) => {
+  toolHandler("memory_code_query", async (params) => {
     const args: Record<string, unknown> = { query: params.query, query_type: params.type };
     return call("memory_code_query", args);
-  }
+  })
 );
 
 const transport = new StdioServerTransport();
@@ -201,6 +227,7 @@ logLine("memory-mcp-ts ready (stdio)");
 const shutdown = async (signal: string) => {
   logLine(`Received ${signal}, shutting down`);
   await server.close();
+  otelSdk.shutdown();
   process.exit(0);
 };
 

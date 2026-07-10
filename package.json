@@ -5,10 +5,14 @@
   "description": "Memory MCP server — file-based memory storage with LLM rerank",
   "scripts": {
     "build": "tsc",
+    "type-check": "tsc --noEmit",
     "start": "node dist/server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.220.0",
+    "@opentelemetry/instrumentation-http": "^0.220.0",
+    "@opentelemetry/sdk-node": "^0.220.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
