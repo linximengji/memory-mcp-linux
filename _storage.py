@@ -5,7 +5,7 @@ from pathlib import Path
 from config import MEMORY_ROOT, PROXY_URL, LLM_MODEL
 FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL | re.MULTILINE)
 
-VALID_SEGMENTS = frozenset({"_index", "overview", "deps", "design", "sop"})
+VALID_SEGMENTS = frozenset({"_index", "overview", "deps", "design", "sop", "persona"})
 
 # Single source of truth for segment definitions — consumed by extraction prompt, health checks
 # Core principle: memories reflect CURRENT reality, NOT historical trajectory.
@@ -41,6 +41,12 @@ SEGMENT_GUIDES = {
         "what": "具有现实意义的方法论：诊断思路（看到症状 X 先查 Y）、防御性知识（系统边界行为 A 会表现为 B，别误判为 C）、行动规范（做 X 前先做 Y）。回答为什么系统会这样行为。",
         "example": "SSE 连接空闲 30s 断开，根因是 HTTP/1.1 keep-alive 超时，不是 service down。误判为服务不可用会导致不必要的重启。",
         "style": "触发条件 → 排查怎么做 → 根因 → 误判后果。每条约立，不依赖历史上下文。",
+    },
+    "persona": {
+        "title": "用户画像",
+        "what": "从对话中自然提取的用户叙事画像。身份角色/沟通偏好/决策风格/思维模式/学习方式/审美倾向/当前兴趣/拒绝模式。每项标置信度 [高][中][低]。",
+        "example": "[高] 独立开发者，Python+TS 双主。[中] 深夜思考架构。[低] 尚未暴露日常生活习惯。",
+        "style": "叙事段落，持续更新。每个声明前标置信度。不记录历史版本。",
     },
 }
 

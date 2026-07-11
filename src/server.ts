@@ -16,7 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { Bridge } from "./bridge.js";
 
-const VALID_SEGMENTS = ["_index", "overview", "deps", "design", "sop"] as const;
+const VALID_SEGMENTS = ["_index", "overview", "deps", "design", "sop", "persona"] as const;
 
 const SCHEMA_NOTE =
   "namespace is the module/project name (e.g. model-proxy, claudetalk). Auto-detected if omitted. " +
