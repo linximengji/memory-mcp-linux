@@ -927,7 +927,7 @@ def _create_memory_review_tasks(flag_items: list[dict], all_issues: list[dict] |
             elif ck == "broken_path":
                 detail = ", ".join(item.get("broken_paths", []))
             else:
-                detail = item.get("reason", "")
+                detail = item.get("reason", "") or item.get("detail", "")
             progress_lines.append(f"- [{name}] {ck}: {detail[:60]}"[:120])
 
     tasks[task_id] = {
