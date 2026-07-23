@@ -301,61 +301,6 @@ def _check_segment_references(fm_cache: list[dict]) -> list[dict]:
                 })
 
     return issues
-
-
-def _check_segment_misplacement(fm_cache: list[dict]) -> list[dict]:
-    """L1 heuristic: detect likely segment-content mismatch via keyword patterns.
-
-    These are WARNINGS only — auto-fix is unsafe (keywords can appear legitimately).
-    Pattern sets are a static approximation; false positives are acceptable at L1 level
-    as long as the check creates a task for human review.
-    """
-    # Patterns that suggest content belongs in a DIFFERENT segment
-    MISPLACEMENT_RULES = {
-        "design": {  # design 段出现操作/陷阱关键词 → 可能应归 sop
-            "hint": "可能应归 sop（操作与陷阱）",
-            "patterns": re.compile(
-                r'(步骤|命令|启动|停止|重启|kill|workaround|安装|部署|调试|'
-                r'修复|npm\s+(install|run|start)|pip\s+install|docker\s+(run|compose|build))',
-                re.IGNORECASE,
-            ),
-        },
-        "sop": {  # sop 段出现设计决策关键词 → 可能应归 design
-            "hint": "可能应归 design（设计决策）",
-            "patterns": re.compile(
-                r'(为什么选|权衡|方案对比|vs\.|design decision|'
-                r'trade.?off|备选方案|架构选型)',
-                re.IGNORECASE,
-            ),
-        },
-        "overview": {  # overview 出现操作关键词 → 可能应归 sop
-            "hint": "可能应归 sop（操作与陷阱）",
-            "patterns": re.compile(
-                r'(启动步骤|安装命令|部署流程|debug|调试方法)',
-                re.IGNORECASE,
-            ),
-        },
-    }
-
-    issues = []
-    for fm in fm_cache:
-        name = fm.get("name", "?")
-        ns = fm.get("namespace", "?")
-        seg = fm.get("segment", "")
-        body = fm.get("_body", "")
-
-        rule = MISPLACEMENT_RULES.get(seg)
-        if not rule:
-            continue
-        if rule["patterns"].search(body):
-            issues.append({
-                "file": name, "ns": ns, "segment": seg, "check": "segment_misplacement",
-                "detail": rule["hint"],
-            })
-
-    return issues
-
-
 def _build_segment_guide_text() -> str:
     """Build a compact segment definition string for LLM prompts."""
     return "\n".join(
@@ -997,7 +942,6 @@ def format_html(result: dict) -> str:
     broken = result.get("broken_links", [])
     cleaned = result.get("cleaned", 0)
     fixed_links = result.get("fixed_links", 0)
-    segment_misplacements = result.get("segment_misplacements", [])
 
     summary_parts = [f"文件 {stats.get('files_total', 0)} 个"]
     total_lines = stats.get("lines_total", 0)
@@ -1045,23 +989,6 @@ def format_html(result: dict) -> str:
             f'<table class="data-table">'
             f'<col style="width:50%"><col style="width:20%" class="num"><col style="width:30%">'
             f'<tr><th>文件</th><th class="num">行数</th><th>建议</th></tr>{o_rows}</table>'
-        )
-
-    # ── segment misplacements (L1, heuristic) ──
-    if segment_misplacements:
-        sm_rows = "".join(
-            f'<tr><td class="mem-name">{sm["file"][:28]}</td>'
-            f'<td>{sm.get("segment","")}</td>'
-            f'<td style="font-size:11px;color:#636e72">{sm.get("detail","")}</td></tr>\n'
-            for sm in segment_misplacements
-        )
-        parts.append(
-            f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
-            f'段归属异常 ({len(segment_misplacements)} 条，启发式扫描)'
-            f'</div>'
-            f'<table class="data-table">'
-            f'<col style="width:30%"><col style="width:12%"><col style="width:58%">'
-            f'<tr><th>文件</th><th>当前段</th><th>建议</th></tr>{sm_rows}</table>'
         )
 
     audit_results = result.get("audit_results", [])
@@ -1218,7 +1145,6 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
     cleaned = _cleanup_orphans(orphans)
     fixed_links = _fix_broken_links(broken, fm_cache)
     segment_refs = _check_segment_references(fm_cache)
-    segment_misplacements = _check_segment_misplacement(fm_cache)
 
     result: dict[str, Any] = {
         "stats": stats,
@@ -1227,7 +1153,6 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         "cleaned": len(cleaned),
         "fixed_links": fixed_links,
         "segment_refs": segment_refs,
-        "segment_misplacements": segment_misplacements,
         "audit_results": [],
         "flag_items": [],
         "consolidations": [],
@@ -1249,8 +1174,7 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         result["model_disagreements"] = _multi_model_audit(fm_cache, flash_results=audit_results)
 
         all_issues = (result["completeness_issues"] + result["path_issues"]
-                      + result["model_disagreements"]
-                      + result["segment_misplacements"])
+                      + result["model_disagreements"])
         _write_review_json(result["flag_items"], all_issues)
         _create_memory_review_tasks(result["flag_items"], all_issues)
 
@@ -1262,6 +1186,5 @@ def health_snapshot() -> dict:
     fm_cache = _build_fm_cache()
     return {
         "segment_refs": _check_segment_references(fm_cache),
-        "segment_misplacements": _check_segment_misplacement(fm_cache),
         "stats": _compute_stats(fm_cache),
     }
