@@ -52,11 +52,13 @@ const MemoryListSchema = z.object({
 
 const MemoryDeleteSchema = z.object({
   name: z.string(),
+  namespace: z.string().optional(),
 });
 
 const MemoryReviewSchema = z.object({
-  action: z.enum(["apply", "dismiss"]),
-  file: z.string().default(""),
+  action: z.enum(["list", "confirm", "dismiss", "dismiss-all"]),
+  name: z.string().default(""),
+  namespace: z.string().optional(),
 });
 
 const MemoryCleanupSchema = z.object({
@@ -157,7 +159,6 @@ server.registerTool(
 
 const HealthCheckSchema = z.object({
   llm_enabled: z.boolean().default(false),
-  output_format: z.enum(["json", "html"]).default("json"),
 });
 
 server.registerTool(

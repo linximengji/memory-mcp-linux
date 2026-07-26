@@ -2,7 +2,7 @@
 
 5 segments: _index / overview / deps / design / sop
 """
-import re, sys, os
+import argparse, re, sys, os
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,9 +14,9 @@ from _storage import MEMORY_ROOT, FM_RE, VALID_SEGMENTS
 # ── Keyword-based heuristic (90%+ accuracy for well-written memories) ──
 
 SOP_PATTERNS = re.compile(
-    r'(步骤|命令|启动|停止|重启|kill|workaround|安装|部署|调试|'
+    r'(操作步骤|命令|启动|停止|重启|kill|workaround|安装|部署|调试|'
     r'修复|npm\s+(install|run|start)|pip\s+install|docker\s+(run|compose|build)|'
-    r'操作流程|故障排查|运行|执行|报错|错误|'
+    r'操作流程|故障排查|排查步骤|'
     r'safekill|看门狗|守护)',
     re.IGNORECASE,
 )
@@ -29,8 +29,8 @@ DESIGN_PATTERNS = re.compile(
 )
 
 DEPS_PATTERNS = re.compile(
-    r'(依赖|依赖方|被.*?依赖|上游|下游|端口|API[^K]|'
-    r'文件级接口|跨项目|配置键|映射)',
+    r'(依赖方|被.*?依赖|上游|下游|端口|API[^K]|'
+    r'文件级接口|跨项目|配置键)',
     re.IGNORECASE,
 )
 
@@ -71,8 +71,8 @@ def guess_segment(name: str, body: str, content: str) -> str:
     return "_index"
 
 
-def update_segment(path: Path, new_segment: str) -> bool:
-    """Rewrite segment in frontmatter (add if missing)."""
+def update_segment(path: Path, new_segment: str, write: bool = True) -> bool:
+    """Rewrite segment in frontmatter (add if missing). Returns whether it differs."""
     raw = path.read_text(encoding="utf-8")
     m = FM_RE.match(raw)
     if not m:
@@ -98,6 +98,9 @@ def update_segment(path: Path, new_segment: str) -> bool:
         # Insert before body content (between name line and rest)
         new_meta.append(f"segment: {new_segment}")
 
+    if not write:
+        return True
+
     path.write_text(
         "---\n" + "\n".join(new_meta) + "\n---\n" + body.strip() + "\n",
         encoding="utf-8",
@@ -106,27 +109,24 @@ def update_segment(path: Path, new_segment: str) -> bool:
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true", help="write changes (default: dry-run preview)")
+    args = ap.parse_args()
+
     total = 0
     changed = 0
-    need_llm = []
 
-    print("── Phase 1: keyword-based inference ──")
+    print("── keyword-based inference ──")
     for mem in s._iter_memories():
         total += 1
         seg = guess_segment(mem["name"], mem["content"], mem["content"])
-        if update_segment(mem["path"], seg):
+        if update_segment(mem["path"], seg, write=args.apply):
             print(f"  [{changed+1}] {mem['path'].relative_to(MEMORY_ROOT)} → {seg}")
             changed += 1
 
-    print(f"\n└ {changed} changed, {total} total")
-
-    if need_llm:
-        print(f"\n── Phase 2: LLM inference for {len(need_llm)} entries ──")
-        for name, ns, body, path in need_llm:
-            seg = guess_segment_by_llm(name, body)
-            if update_segment(path, seg):
-                changed += 1
-                print(f"  [LLM] {path.relative_to(MEMORY_ROOT)} → {seg}")
+    if not args.apply:
+        print(f"\nDry-run: {changed} would change, {total} total. Re-run with --apply to write.")
+        return 0
 
     s.memory_rebuild_index()
     print(f"\nDone. {changed} files updated.")

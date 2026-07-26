@@ -14,7 +14,8 @@ from pathlib import Path
 # We extract the source path from after 'from' keyword via the always-present from-group.
 TS_IMPORT_RE = re.compile(r"""
     import\s+
-    (?:\{([^}]*)\}|default\s+(\w+)|(\w+)\s*,\s*\{([^}]*)\}|(\w+))
+    (?:type\s+)?
+    (?:\{([^}]*)\}|\*\s+as\s+\w+|default\s+(\w+)|(\w+)\s*,\s*\{([^}]*)\}|(\w+))
     \s+from\s+[\"']([^\"']+)[\"']
 """, re.VERBOSE)
 
@@ -67,8 +68,7 @@ def detect_imports_py(file_path: Path, content: str) -> list[dict]:
                 })
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            # Skip relative imports (start with dot)
-            if module.startswith("."):
+            if node.level > 0:
                 continue
             symbols = [alias.name for alias in node.names]
             imports.append({

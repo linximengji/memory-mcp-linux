@@ -153,9 +153,9 @@ def replace_project_edges(project: str, edges: list[dict]) -> None:
             rows = [
                 (
                     project,
-                    e.get("src", {}).get("file", ""),
+                    _normalize_path(e.get("src", {}).get("file", "")),
                     e.get("dst", {}).get("project", ""),
-                    e.get("dst", {}).get("file", ""),
+                    _normalize_path(e.get("dst", {}).get("file", "")),
                     e.get("dst", {}).get("symbol", ""),
                     e.get("kind", ""),
                     e.get("confidence", "extracted"),
@@ -182,7 +182,7 @@ def replace_project_symbols(project: str, symbols: list[dict]) -> None:
         conn.execute("DELETE FROM symbols WHERE project = ?", (project,))
         if symbols:
             rows = [
-                (s["name"], s.get("kind", "symbol"), s.get("file", ""),
+                (s["name"], s.get("kind", "symbol"), _normalize_path(s.get("file", "")),
                  s.get("line", 0), project)
                 for s in symbols
             ]
@@ -249,6 +249,18 @@ def migrate_from_json() -> bool:
             cnt = conn.execute("SELECT COUNT(*) AS c FROM projects").fetchone()
             if cnt and cnt[0] > 0:
                 return False
+        # Partial migration guard: if edges/symbols already have rows but projects
+        # is empty, a previous run crashed mid-way — skip those tables to avoid dupes
+        def _has_data(table: str) -> bool:
+            r = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not r or not r[0]:
+                return False
+            return conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()[0] > 0
+        skip_edges = _has_data("edges")
+        skip_symbols = _has_data("symbols")
     finally:
         conn.close()
     # Table may exist empty — still run init/migrate
@@ -272,7 +284,7 @@ def migrate_from_json() -> bool:
 
     # edges
     edge_rows: list[tuple] = []
-    if LEGACY_EDGES.exists():
+    if not skip_edges and LEGACY_EDGES.exists():
         try:
             edges = json.loads(LEGACY_EDGES.read_text(encoding="utf-8"))
             for e in edges:
@@ -289,6 +301,7 @@ def migrate_from_json() -> bool:
         except Exception:
             pass
     if edge_rows:
+        edge_rows = list(dict.fromkeys(edge_rows))
         _execute_many(
             """INSERT INTO edges
                (src_project, src_file, dst_project, dst_file, dst_symbol,
@@ -299,7 +312,7 @@ def migrate_from_json() -> bool:
 
     # symbols
     sym_rows: list[tuple] = []
-    if LEGACY_SYMBOLS.exists():
+    if not skip_symbols and LEGACY_SYMBOLS.exists():
         try:
             symbols = json.loads(LEGACY_SYMBOLS.read_text(encoding="utf-8"))
             for s in symbols:
@@ -313,6 +326,7 @@ def migrate_from_json() -> bool:
         except Exception:
             pass
     if sym_rows:
+        sym_rows = list(dict.fromkeys(sym_rows))
         _execute_many(
             "INSERT INTO symbols (name, kind, file_path, line, project) VALUES (?, ?, ?, ?, ?)",
             sym_rows,
@@ -429,6 +443,22 @@ def get_last_scanned() -> str | None:
     """Return last_scanned timestamp from scan_meta, or None if never scanned."""
     r = _execute("SELECT value FROM scan_meta WHERE key='last_scanned'")
     return r[0]["value"] if r else None
+
+
+def get_scan_state(project: str) -> str | None:
+    """Return stored scan state (last git rev) for a project, or None."""
+    r = _execute("SELECT value FROM scan_meta WHERE key = ?", (f"rev:{project}",))
+    return r[0]["value"] if r else None
+
+
+def set_scan_state(project: str, value: str) -> None:
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR REPLACE INTO scan_meta (key, value) VALUES (?, ?)",
+                     (f"rev:{project}", value))
+        conn.commit()
+    finally:
+        conn.close()
 
 def _normalize_path(path: str) -> str:
     """Normalize separator to platform default for consistent DB matching."""

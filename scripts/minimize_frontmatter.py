@@ -3,7 +3,7 @@ import re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import MEMORY_DIR as MEMORY_ROOT
+from config import MEMORY_ROOT
 MEMORY_DIR = MEMORY_ROOT
 FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL | re.MULTILINE)
 

@@ -15,7 +15,7 @@ PORT_PROJECT_MAP: dict[int, str] = {
 # Known localhost URL patterns that indicate cross-project HTTP calls
 LOCALHOST_RE = re.compile(r"""
     (?:localhost|127\.0\.0\.1|0\.0\.0\.0)
-    :(\d{4})
+    :(\d{2,5})
 """, re.VERBOSE | re.IGNORECASE)
 
 # Patterns that reference a project by name in an HTTP URL,

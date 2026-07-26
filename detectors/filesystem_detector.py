@@ -9,12 +9,11 @@ from config import WORKSPACE_ROOT
 REL_PATH_RE = re.compile(r"""
     (?:resolve|join|dirname|realpath|joinpath)
     \s*\(
-    (.*?)
+    ([^)\n]*)
     \)
-""", re.VERBOSE | re.IGNORECASE | re.DOTALL)
+""", re.VERBOSE | re.IGNORECASE)
 
-# Direct string references to workspace/<project> in code
-_WS_NAME = WORKSPACE_ROOT.name
+# Direct string references to the real workspace absolute path + a project
 _ws_root_escaped = re.escape(str(WORKSPACE_ROOT).replace('\\', '/'))
 ABSOLUTE_PATH_RE = re.compile(
     rf"""
@@ -22,17 +21,6 @@ ABSOLUTE_PATH_RE = re.compile(
     (?:{_ws_root_escaped})/
     ([^/\\\"'\s)]+)
     (?:/|\\)
-""", re.VERBOSE | re.IGNORECASE)
-
-# Also match <ws_name>/<project> patterns in paths (works for both Windows/Linux)
-WS_NAME_RE = re.compile(
-    rf"""
-    [\"']
-    (?:/|\\\\|[A-Za-z]:)?[/\\\\]
-    {re.escape(_WS_NAME)}
-    [/\\\\]
-    ([^/\\\"'\s)]+)
-    [/\\\\]
 """, re.VERBOSE | re.IGNORECASE)
 
 # Reference like '../ops-daemon/data/...' in path arguments
@@ -63,21 +51,6 @@ def detect(file: Path, content: str, projects: set[str]) -> list[dict]:
     for m in ABSOLUTE_PATH_RE.finditer(content):
         dst = m.group(1)
         if dst in projects and dst != src_project:
-            edges.append({
-                "src": {"project": src_project, "file": str(file)},
-                "dst": {"project": dst},
-                "kind": "filesystem-reads",
-                "confidence": "extracted",
-                "detail": m.group().strip("\"'"),
-            })
-
-    # 2. Check workspace name/<name> patterns
-    for m in WS_NAME_RE.finditer(content):
-        dst = m.group(1)
-        if dst in projects and dst != src_project:
-            # Skip if already found by ABSOLUTE_PATH_RE
-            if any(e["dst"]["project"] == dst for e in edges):
-                continue
             edges.append({
                 "src": {"project": src_project, "file": str(file)},
                 "dst": {"project": dst},

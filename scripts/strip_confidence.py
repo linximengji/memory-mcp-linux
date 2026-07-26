@@ -1,6 +1,8 @@
 """Batch remove `confidence:` lines from all .md frontmatter files under MEMORY_DIR."""
 import re, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import MEMORY_ROOT
 MEMORY_DIR = MEMORY_ROOT
 pattern = re.compile(r"^confidence: .*$", re.MULTILINE)
 

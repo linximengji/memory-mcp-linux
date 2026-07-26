@@ -41,28 +41,29 @@ def main():
         try:
             req = json.loads(line)
         except json.JSONDecodeError as e:
-            _respond(False, error=f"invalid JSON: {e}")
+            _respond(None, False, error=f"invalid JSON: {e}")
             continue
 
+        req_id = req.get("id")
         method = req.get("method", "")
         params = req.get("params", {})
 
         if method in FUNCTIONS:
             fn = lambda: FUNCTIONS[method](**params)
         else:
-            _respond(False, error=f"unknown method: {method}")
+            _respond(req_id, False, error=f"unknown method: {method}")
             continue
 
         try:
             result = fn()
-            _respond(True, result=result)
+            _respond(req_id, True, result=result)
         except Exception as e:
-            _respond(False, error=f"{type(e).__name__}: {e}")
+            _respond(req_id, False, error=f"{type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stderr)
 
 
-def _respond(ok: bool, result: str = "", error: str = ""):
-    sys.stdout.write(json.dumps({"ok": ok, "result": result, "error": error}, ensure_ascii=False) + "\n")
+def _respond(req_id, ok: bool, result: str = "", error: str = ""):
+    sys.stdout.write(json.dumps({"id": req_id, "ok": ok, "result": result, "error": error}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 

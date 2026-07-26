@@ -125,15 +125,18 @@ def _pick_target_path(namespace: str, name: str) -> Path:
     return ns_dir / f"{name}.md"
 
 
+def _read_file_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="gbk")
+
+
 def _parse_file(path: Path) -> dict | None:
     try:
-        raw = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        try:
-            raw = path.read_text(encoding="gbk")
-            path.write_text(raw, encoding="utf-8")
-        except Exception:
-            return None
+        raw = _read_file_text(path)
+    except Exception:
+        return None
     m = FM_RE.match(raw)
     if not m:
         return None
@@ -170,36 +173,7 @@ def _touch_memory(path: Path) -> None:
 INDEX_FILE = MEMORY_ROOT / "MEMORY.md"
 
 
-def _generate_index_line(ns: str) -> str | None:
-    """Generate a single index line for the given namespace."""
-    ns_dir = MEMORY_ROOT / ns
-    if not ns_dir.is_dir():
-        return None
-
-    desc = ""
-    segs: set[str] = set()
-    for f in ns_dir.glob("*.md"):
-        mem = _parse_file(f)
-        if mem is None:
-            continue
-        segs.add(mem["segment"])
-        if mem["segment"] == "_index" and mem.get("description"):
-            # Prefer primary: _index.md > {ns}.md > {ns}-index.md > first found
-            stem = f.stem
-            is_primary = (f.name == "_index.md"
-                          or stem == ns
-                          or stem == f"{ns}-index")
-            if is_primary or not desc:
-                desc = mem["description"][:120]
-
-    if not segs:
-        return None
-
-    segs_str = ", ".join(sorted(segs))
-    return f"- **{ns}** — {desc} (segments: {segs_str})  <!-- category: {category} -->"
-
-
-def _update_index(ns: str) -> None:
+def _update_index() -> None:
     """Update MEMORY.md by rebuilding the full categorized index."""
     _rebuild_index()
 
@@ -246,7 +220,7 @@ def _resolve_path(name: str, namespace: str | None = None) -> Path | None:
     # Last resort: iterate all memories and match frontmatter name
     for mem in _iter_memories():
         if mem["name"] == name:
-            if namespace and mem.get("namespace") != namespace and mem.get("namespace") != "(global)":
+            if namespace and mem.get("namespace") != namespace and mem.get("namespace") != "global":
                 continue
             return mem["path"]
     return None
@@ -269,7 +243,7 @@ def _keyword_score(query: str, mem: dict, pid: str | None) -> float:
     if pid:
         if mem.get("namespace", "") == pid:
             boost = 1.2
-        elif mem["namespace"] == "(global)":
+        elif mem["namespace"] == "global":
             boost = 1.05
         else:
             boost = 0.9
@@ -327,7 +301,8 @@ def _llm_rerank(query: str, candidates: list[dict], top_k: int) -> list[tuple[fl
                 block.get("text", "") for block in data["content"]
                 if block.get("type") == "text"
             ).strip()
-    except Exception:
+    except Exception as e:
+        print(f"[memory_recall] LLM rerank failed ({type(e).__name__}: {e}), falling back to keyword scoring", file=sys.stderr)
         return None
 
     indices = [int(tok.rstrip(".")) for tok in re.split(r"[,，\s]+", text) if tok.strip().rstrip(".").isdigit()]
@@ -352,15 +327,37 @@ def _parse_links(content: str) -> list[tuple[str, str]]:
 def _expand_via_links(ranked: list[tuple[float, dict]], top_k: int) -> list[tuple[float, dict]]:
     if not ranked:
         return ranked
-    all_by_name = {m["name"]: m for m in _iter_memories()}
-    expanded = {m["name"]: (s, m) for s, m in ranked}
+    all_by_name: dict[tuple[str, str], dict] = {}
+    for m in _iter_memories():
+        all_by_name.setdefault((m["namespace"], m["name"]), m)
+    expanded = {(m["namespace"], m["name"]): (s, m) for s, m in ranked}
     for score, mem in ranked:
+        source_ns = mem.get("namespace", "")
         links = _parse_links(mem.get("content", ""))
         for target, rel in links:
-            if target not in all_by_name or target in expanded:
+            if "/" in target:
+                t_ns, t_name = target.split("/", 1)
+                candidates = [all_by_name[(t_ns, t_name)]] if (t_ns, t_name) in all_by_name else []
+            else:
+                t_name = target
+                same_ns = all_by_name.get((source_ns, t_name))
+                if same_ns is not None:
+                    candidates = [same_ns]
+                else:
+                    candidates = [m for (ns, n), m in all_by_name.items() if n == t_name]
+                    if len(candidates) > 1:
+                        print(f"[memory_recall] ambiguous wiki link [[{target}]] from {source_ns}: "
+                              f"matches {sorted({c['namespace'] for c in candidates})}, not expanded",
+                              file=sys.stderr)
+                        continue
+            if not candidates:
+                continue
+            t = candidates[0]
+            key = (t["namespace"], t["name"])
+            if key in expanded:
                 continue
             weight = REL_WEIGHTS.get(rel, 1.0)
-            expanded[target] = (min(score * weight * 0.7, 1.0), all_by_name[target])
+            expanded[key] = (min(score * weight * 0.7, 1.0), t)
     result = sorted(expanded.values(), key=lambda x: -x[0])
     return result[:top_k]
 
@@ -380,7 +377,7 @@ def memory_upsert(name: str, content: str,
     closest_name = None
     closest_score = 0.0
     for mem in _iter_memories():
-        if namespace and mem["namespace"] != namespace and mem.get("namespace") != "(global)":
+        if namespace and mem["namespace"] != namespace and mem.get("namespace") != "global":
             continue
         jd = _jaccard_similarity(content, mem["content"])
         if jd >= SIM_THRESHOLD and jd > closest_score:
@@ -421,7 +418,7 @@ def memory_store(name: str, content: str,
 
     fm = _render_frontmatter(name, ns, segment)
     filepath.write_text(fm + content + "\n", encoding="utf-8")
-    _update_index(ns)
+    _update_index()
     return f"stored: {filepath}"
 
 
@@ -467,7 +464,7 @@ def memory_update(name: str, content: str | None = None,
     new_fm = "---\n" + "\n".join(f"{k}: {v}" for k, v in fm_fields.items()) + "\n---\n"
     mem["path"].write_text(new_fm + body.strip() + "\n", encoding="utf-8")
     if not _skip_rebuild:
-        _update_index(mem["namespace"])
+        _update_index()
     return f"updated: {mem['path']}"
 
 
@@ -477,7 +474,7 @@ def memory_recall(query: str = "", namespace: str | None = None,
     pid = _detect_namespace()
     candidates = []
     for mem in _iter_memories():
-        if namespace and mem["namespace"] != namespace and mem["namespace"] != "(global)":
+        if namespace and mem["namespace"] != namespace and mem["namespace"] != "global":
             continue
         candidates.append(mem)
 
@@ -498,7 +495,7 @@ def memory_recall(query: str = "", namespace: str | None = None,
             if pid:
                 if mem.get("namespace", "") == pid:
                     score *= 1.2
-                elif mem["namespace"] == "(global)":
+                elif mem["namespace"] == "global":
                     score *= 1.05
                 else:
                     score *= 0.9
@@ -557,14 +554,13 @@ def memory_delete(name: str, namespace: str | None = None) -> str:
         if not path or path.parent.name != namespace:
             return f"error: '{name}' not found in namespace '{namespace}'"
         path.unlink()
-        _update_index(namespace)
+        _update_index()
         return f"deleted: {path}"
     # No namespace: search all namespaces, take first match
     for mem in _iter_memories():
         if mem["name"] == name:
-            ns = mem["namespace"]
             mem["path"].unlink()
-            _update_index(ns)
+            _update_index()
             return f"deleted: {mem['path']}"
     return f"error: '{name}' not found"
 
@@ -657,7 +653,7 @@ def memory_cleanup(action: str = "list", names: list[str] | None = None) -> str:
             return "no low-quality candidates"
         if not items:
             return "no low-quality candidates"
-        lines = [f"name={it['name']} ns={it.get('ns','')} action={it.get('action','?')}"
+        lines = [f"name={it['name']} ns={it.get('namespace','')} action={it.get('action','?')}"
                  for it in items if it.get("action") in ("demote", "flag")]
         if not lines:
             return "no low-quality candidates"

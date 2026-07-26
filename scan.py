@@ -19,7 +19,6 @@ from typing import Any
 from config import WORKSPACE_ROOT
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-FILE_TIMEOUT = 10  # seconds per file
 SCAN_WORKERS = 4
 STALE_MINUTES = 30  # re-scan if last scan was this long ago
 _scan_lock = threading.Lock()
@@ -80,7 +79,7 @@ def walk_projects() -> dict[str, dict]:
 
 
 def _find_source_files(root: Path) -> dict[str, str]:
-    """Find all source files in a project, return {rel_path: hash}."""
+    """Find all source files in a project, return {rel_path: ""} (hashes filled lazily)."""
     result: dict[str, str] = {}
     try:
         for path in root.rglob("*"):
@@ -92,13 +91,71 @@ def _find_source_files(root: Path) -> dict[str, str]:
             if path.suffix.lower() in SKIP_EXT:
                 continue
             if path.suffix.lower() in SOURCE_EXT:
-                try:
-                    result[str(path.relative_to(root))] = file_hash(path)
-                except Exception:
-                    pass
+                result[str(path.relative_to(root))] = ""
     except PermissionError:
         pass
     return result
+
+
+def _fill_hashes(root: Path, files: dict[str, str]) -> dict[str, str]:
+    """Compute sha256 for each file (hash-fallback change detection only)."""
+    result: dict[str, str] = {}
+    for rel in files:
+        try:
+            result[rel] = file_hash(root / rel)
+        except Exception:
+            pass
+    return result
+
+
+def _git_rev(project_root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            rev = result.stdout.strip()
+            if rev:
+                return rev
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def _git_files(project_root: Path, base: str | None) -> set[str]:
+    """Changed source files: committed since *base* + uncommitted (diff HEAD) + untracked."""
+    changed: set[str] = set()
+
+    def _add(output: str) -> None:
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if line and any(line.endswith(ext) for ext in SOURCE_EXT):
+                changed.add(line)
+
+    try:
+        if base:
+            r = subprocess.run(
+                ["git", "-C", str(project_root), "diff", "--name-only", base, "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                _add(r.stdout)
+        r = subprocess.run(
+            ["git", "-C", str(project_root), "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            _add(r.stdout)
+        r = subprocess.run(
+            ["git", "-C", str(project_root), "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            _add(r.stdout)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return changed
 
 
 def _lang_for_ext(ext: str) -> str:
@@ -111,76 +168,6 @@ def _lang_for_ext(ext: str) -> str:
         ".mjs": "javascript",
         ".cjs": "javascript",
     }.get(ext.lower(), "unknown")
-
-
-def detect_changes_git(project_root: Path) -> set[str]:
-    """Use git diff --name-only to find changed files since last commit.
-
-    Returns empty set on failure (caller falls back to hash comparison).
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_root), "diff", "--name-only", "HEAD"],
-            capture_output=True, text=True, timeout=30,
-        )
-        changed: set[str] = set()
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if line and any(line.endswith(ext) for ext in SOURCE_EXT):
-                    changed.add(line)
-        result2 = subprocess.run(
-            ["git", "-C", str(project_root), "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result2.returncode == 0:
-            for line in result2.stdout.strip().split("\n"):
-                line = line.strip()
-                if line and any(line.endswith(ext) for ext in SOURCE_EXT):
-                    changed.add(line)
-        return changed
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return set()
-
-
-def find_changed_files(
-    prev_files: dict[str, dict[str, str]],
-    curr_files: dict[str, dict[str, str]],
-    project_roots: dict[str, Path] | None = None,
-) -> tuple[set[str], dict[str, set[str]]]:
-    """Find projects and exact files that changed.
-
-    project_roots: mapping of project_name -> Path for git-based detection.
-                   When provided, git diff is preferred; otherwise hash fallback.
-
-    Returns:
-        (changed_project_names, {project_name: {changed_rel_paths}})
-    """
-    changed: set[str] = set()
-    git_files: dict[str, set[str]] = {}
-
-    for pname, pinfo in curr_files.items():
-        if project_roots:
-            root = project_roots.get(pname)
-            if root and root.exists():
-                git_set = detect_changes_git(root)
-                if git_set:
-                    # Only mark changed if git_files differ from prev hash state
-                    prev = prev_files.get(pname, {})
-                    new_files = {f for f in git_set if f in pinfo.get("files", {})}
-                    actual_changes = {f for f in new_files
-                                      if f not in prev or prev[f] != pinfo["files"][f]}
-                    if actual_changes:
-                        changed.add(pname)
-                        git_files[pname] = git_set
-                    continue
-
-        # Fallback: hash comparison
-        prev = prev_files.get(pname, {})
-        if prev != pinfo:
-            changed.add(pname)
-
-    return changed, git_files
 
 
 def filter_source_files(
@@ -225,18 +212,41 @@ def scan(projects_filter: list[str] | None = None, **kwargs) -> str:
 
     if projects_filter:
         valid = [p for p in projects_filter if p in all_projects]
-        missing = [p for p in projects_filter if p not in all_projects]
         all_projects = {p: all_projects[p] for p in valid}
 
-    # Incremental: detect changes via git (preferred) or hash fallback
-    prev_state = db.load_projects()
-    prev_files = {pname: pinfo.get("files", {}) for pname, pinfo in prev_state.items()}
-    curr_files = {pname: pinfo.get("files", {}) for pname, pinfo in all_projects.items()}
-    all_roots: dict[str, Path] = {
-        pname: Path(pinfo["root"])
-        for pname, pinfo in all_projects.items()
+    project_roots: dict[str, Path] = {
+        pname: Path(pinfo["root"]) for pname, pinfo in all_projects.items()
     }
-    changed_projects, git_files = find_changed_files(prev_files, curr_files, all_roots)
+    project_names: set[str] = set(all_projects)
+
+    changed_projects: set[str] = set()
+    git_files: dict[str, set[str]] = {}
+    rev_to_save: dict[str, str] = {}
+    prev_state = db.load_projects()
+    for pname, pinfo in all_projects.items():
+        root = project_roots[pname]
+        curr_rev = _git_rev(root)
+        if curr_rev is None:
+            # Not a git repo: hash fallback (only branch that computes hashes)
+            curr_hashes = _fill_hashes(root, pinfo["files"])
+            pinfo["files"] = curr_hashes
+            if prev_state.get(pname, {}).get("files", {}) != curr_hashes:
+                changed_projects.add(pname)
+            continue
+        last_rev = db.get_scan_state(pname)
+        if last_rev is None:
+            # First scan for this project: scan all files
+            changed_projects.add(pname)
+            git_files[pname] = set(pinfo["files"])
+            rev_to_save[pname] = curr_rev
+            continue
+        gfiles = _git_files(root, last_rev)
+        if not gfiles:
+            db.set_scan_state(pname, curr_rev)
+            continue
+        changed_projects.add(pname)
+        git_files[pname] = gfiles
+        rev_to_save[pname] = curr_rev
 
     if not changed_projects:
         elapsed = time.time() - start
@@ -250,12 +260,6 @@ def scan(projects_filter: list[str] | None = None, **kwargs) -> str:
             "elapsed_ms": round(elapsed * 1000),
             "message": "no changes detected",
         })
-
-    project_roots: dict[str, Path] = {
-        pname: Path(pinfo["root"])
-        for pname, pinfo in all_projects.items()
-    }
-    project_names: set[str] = set(all_projects)
 
     source_files = filter_source_files(all_projects, changed_projects, git_files)
 
@@ -294,8 +298,7 @@ def scan(projects_filter: list[str] | None = None, **kwargs) -> str:
             project_edges[pname].extend(edges)
             project_symbols[pname].extend(symbols)
 
-    def _scan_with_timeout(pname: str, fpath: str) -> None:
-        """Run _scan_file with timeout guard."""
+    def _scan_file_safe(pname: str, fpath: str) -> None:
         try:
             _scan_file(pname, fpath)
         except Exception:
@@ -303,12 +306,12 @@ def scan(projects_filter: list[str] | None = None, **kwargs) -> str:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
         fut_to_key = {
-            executor.submit(_scan_with_timeout, pname, fpath): (pname, fpath)
+            executor.submit(_scan_file_safe, pname, fpath): (pname, fpath)
             for pname, _rel_path, fpath, _lang in source_files
         }
         for fut in concurrent.futures.as_completed(fut_to_key, timeout=300):
             try:
-                fut.result(timeout=FILE_TIMEOUT)
+                fut.result()
             except Exception:
                 pass  # per-file timeout or error is non-fatal
 
@@ -319,6 +322,8 @@ def scan(projects_filter: list[str] | None = None, **kwargs) -> str:
 
     # Persist file hashes for changed projects only, without losing others
     db.upsert_projects(all_projects, changed_projects)
+    for pname, rev in rev_to_save.items():
+        db.set_scan_state(pname, rev)
 
     elapsed = time.time() - start
     summary: dict[str, Any] = {
@@ -432,7 +437,9 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
                     })
                     queue.append((key, depth + 1, new_path))
 
-            elif current.startswith("file:") and dst_f and (current[5:] == dst_f or dst_f in current[5:]):
+            elif current.startswith("file:") and dst_f and (
+                db._normalize_path(current[5:]) == db._normalize_path(dst_f)
+            ):
                 key = f"file:{src_f}" if src_f else f"proj:{src_p}"
                 if key not in visited and key not in impacted_seen:
                     impacted_seen.add(key)

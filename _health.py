@@ -25,7 +25,7 @@ MEMORY_DIR = MEMORY_ROOT
 INDEX_FILE = MEMORY_DIR / "MEMORY.md"
 REVIEW_REPORT = MEMORY_DIR / "review-report.md"
 DISMISSED_FILE = MEMORY_DIR / ".dismissed"
-SECOND_MODEL = "qwen3.7-max"
+SECOND_MODEL = os.environ.get("MM_SECOND_MODEL", "qwen3.8-max-preview")
 
 FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 WIKI_RE = re.compile(r"\[\[([^\]]+?)(?:\|[^\]]*)?\]\]")
@@ -96,6 +96,7 @@ def _call_llm(prompt: str, model: str = LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "thinking": {"type": "enabled"},
         }).encode("utf-8")
         req = urllib.request.Request(
             PROXY_URL,
@@ -392,7 +393,7 @@ def _deep_audit(fm_cache: list[dict]) -> list[dict]:
             f"name: {name}\nns: {ns}\nage: {age}d\n---\n{body}{sensitive_note}"
         )
 
-        reply = _call_llm(prompt, max_tokens=300, temperature=0.3)
+        reply = _call_llm(prompt, max_tokens=300, temperature=0.3, timeout=45)
         if reply.startswith("__LLM_ERROR__"):
             results.append({"file": name, "error": reply.split(":", 1)[1]})
             continue
@@ -610,7 +611,9 @@ def _detect_contradictions(fm_cache: list[dict]) -> list[dict]:
     return [c for c in contradictions if c.get("verdict") == "contradiction"]
 
 
-def _check_completeness(fm_cache: list[dict]) -> list[dict]:
+def _check_completeness(fm_cache: list[dict], max_items: int = 10) -> list[dict]:
+    """Check memory completeness, returning at most max_items results.
+    Prioritizes by: 1) sop/deps/design (operational impact), 2) most missing elements."""
     REQUIRED: dict[str, list[tuple]] = {
         "_index": [
             (r"(描述|简介|概述|项目|what|是什么)", "项目描述"),
@@ -638,6 +641,8 @@ def _check_completeness(fm_cache: list[dict]) -> list[dict]:
         ],
     }
 
+    _SEG_PRIORITY = {"sop": 0, "deps": 1, "design": 2, "overview": 3, "_index": 4}
+
     results = []
     for fm in fm_cache:
         seg = fm.get("segment", "")
@@ -651,7 +656,10 @@ def _check_completeness(fm_cache: list[dict]) -> list[dict]:
             results.append({"name": name, "ns": fm.get("namespace", ""),
                             "segment": seg, "missing_elements": missing,
                             "check": "completeness"})
-    return results
+
+    results.sort(key=lambda r: (_SEG_PRIORITY.get(r["segment"], 9),
+                                -len(r["missing_elements"])))
+    return results[:max_items]
 
 
 _CONFIG_FILES = [
@@ -726,7 +734,7 @@ def _run_single_model_audit(candidates: list[dict], model: str) -> list[dict]:
             f"name: {name}\nns: {ns}\nage: {age}d\n---\n{body}{sensitive_note}"
         )
 
-        reply = _call_llm(prompt, model=model, max_tokens=300, temperature=0.3)
+        reply = _call_llm(prompt, model=model, max_tokens=300, temperature=0.3, timeout=45)
         if reply.startswith("__LLM_ERROR__"):
             results.append({"file": name, "error": reply.split(":", 1)[1]})
             continue
@@ -868,7 +876,9 @@ def _create_memory_review_tasks(flag_items: list[dict], all_issues: list[dict] |
             ck = item.get("check", "?")
             name = item.get("name") or item.get("file", "?")
             if ck == "completeness":
+                seg = item.get("segment", "")
                 detail = ", ".join(item.get("missing_elements", []))
+                progress_lines.append(f"- [{name}]({seg}) {detail[:80]}")
             elif ck == "broken_path":
                 detail = ", ".join(item.get("broken_paths", []))
             else:
@@ -1169,7 +1179,7 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         result["flag_items"] = [r for r in audit_results if r.get("action") == "flag"]
         result["consolidations"] = consolidations
         result["contradictions"] = _detect_contradictions(fm_cache)
-        result["completeness_issues"] = _check_completeness(fm_cache)
+        result["completeness_issues"] = _check_completeness(fm_cache, max_items=10)
         result["path_issues"] = _verify_file_paths(fm_cache)
         result["model_disagreements"] = _multi_model_audit(fm_cache, flash_results=audit_results)
 

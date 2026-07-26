@@ -16,7 +16,7 @@ SPAWN_RE = re.compile(r"""
 # Direct file path references that look like a script to spawn
 PATH_ARG_RE = re.compile(r"""
     [\"']
-    (?:python|node|powershell|bash)
+    (?:python|python3(?:\.\d+)?|node|node\d+(?:\.\d+)*|powershell|bash)
     (?:\.exe)?
     [\"']\s*,\s*[\"']
     (.*?)

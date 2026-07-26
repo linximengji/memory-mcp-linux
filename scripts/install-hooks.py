@@ -20,10 +20,12 @@ HOOK_SCRIPT = WORKSPACE / "memory-mcp" / "scripts" / "code_graph_hook.py"
 # Skip these directories (no hooks needed)
 SKIP = frozenset({"memory-mcp", "node_modules", ".git", "__pycache__"})
 
-POST_COMMIT_TEMPLATE = """#!/bin/sh
-# Auto-update memory-mcp code-graph after commit
-python3 "{}" "{}"
-""".format(str(HOOK_SCRIPT).replace("\\", "/"), "{}")
+MARKER = "# >>> memory-mcp code-graph hook >>>"
+MARKER_END = "# <<< memory-mcp code-graph hook <<<"
+
+
+def hook_cmd(project_path: str) -> str:
+    return f'python3 "{str(HOOK_SCRIPT).replace(chr(92), "/")}" "{project_path}"'
 
 
 def install() -> None:
@@ -63,16 +65,26 @@ def install() -> None:
             hooks_dir.mkdir(parents=True, exist_ok=True)
 
         post_commit = hooks_dir / "post-commit"
-        hook_content = POST_COMMIT_TEMPLATE.format(
-            str(entry).replace("\\", "/")
-        )
+        cmd = hook_cmd(str(entry).replace("\\", "/"))
 
-        post_commit.write_text(hook_content, encoding="utf-8")
+        if post_commit.exists():
+            existing = post_commit.read_text(encoding="utf-8")
+            if MARKER in existing:
+                print(f"  up-to-date: {entry.name}")
+                continue
+            # Preserve foreign hook content; back it up before appending
+            backup = post_commit.with_suffix(".bak")
+            backup.write_text(existing, encoding="utf-8")
+            if not existing.endswith("\n"):
+                existing += "\n"
+            post_commit.write_text(existing + f"{MARKER}\n{cmd}\n{MARKER_END}\n", encoding="utf-8")
+            print(f"  appended: {entry.name} (backed up to {backup.name})")
+        else:
+            post_commit.write_text(f"#!/bin/sh\n{MARKER}\n{cmd}\n{MARKER_END}\n", encoding="utf-8")
+            print(f"  installed: {entry.name}")
         # Make executable (on Windows this is advisory but consistent)
         current = post_commit.stat().st_mode
         post_commit.chmod(current | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-        print(f"  installed: {entry.name}")
         installed += 1
 
     print(f"\nDone. {installed} hooks installed, {skipped} skipped.")
