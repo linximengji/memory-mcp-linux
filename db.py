@@ -445,6 +445,23 @@ def get_last_scanned() -> str | None:
     return r[0]["value"] if r else None
 
 
+def get_freshness_info() -> dict:
+    """Return freshness metadata for consumer-side use.
+
+    Returns:
+        {last_scanned: str|None, project_count: int, stale_minutes: int,
+         projects: {name: {rev: str, last_scanned: str}}}
+    """
+    last = get_last_scanned()
+    projects = load_projects()
+    return {
+        "last_scanned": last,
+        "project_count": len(projects),
+        "stale_minutes": 30,
+        "projects": {n: {"rev": get_scan_state(n) or ""} for n in projects},
+    }
+
+
 def get_scan_state(project: str) -> str | None:
     """Return stored scan state (last git rev) for a project, or None."""
     r = _execute("SELECT value FROM scan_meta WHERE key = ?", (f"rev:{project}",))

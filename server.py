@@ -120,14 +120,14 @@ def memory_code_scan_wrapper(projects_filter: list[str] | None = None) -> str:
 
 
 @mcp.tool(name="memory_trace_impact")
-def memory_trace_impact_wrapper(target: str, depth: int = 3) -> str:
-    """[Trigger: 准备改函数签名/API接口/文件路径/配置字段前, 想了解改动波及范围] BFS 影响链追踪。传入目标文件路径(绝对或项目相对),返回所有下游依赖方(项目+文件+距离)。内部自动检查代码图新鲜度,过时则增量扫描。距离1=高风险,2=中,3+=低。"""
-    return trace_impact(target, depth)
+def memory_trace_impact_wrapper(target: str, depth: int = 3, min_risk: str | None = None) -> str:
+    """[Trigger: 准备改函数签名/API接口/文件路径/配置字段前, 想了解改动波及范围] BFS 影响链追踪。传入目标文件路径(绝对或项目相对),返回所有下游依赖方(项目+文件+距离)。内部自动检查代码图新鲜度,过时则增量扫描。距离1=高风险,2=中,3+=低。每条影响带 certainty 字段标明可信度。"""
+    return trace_impact(target, depth, min_risk=min_risk)
 
 
 @mcp.tool(name="memory_code_query")
 def memory_code_query_wrapper(query: str, type: str = "symbol") -> str:
-    """[Trigger: 搜函数/类/变量定义、查谁在调用、找文件的导出符号列表] 查询代码图符号索引。type=symbol→搜定义位置(自动FTS5); type=consumer→查谁调用了该符号; type=exporter→列出文件的所有导出符号。内部自动检查代码图新鲜度。"""
+    """[Trigger: 搜函数/类/变量定义、查谁在调用、找文件的导出符号列表] 查询代码图符号索引。type=symbol→搜定义位置(自动FTS5); type=consumer→查谁调用了该符号; type=exporter→列出文件的所有导出符号。返回 freshness 段标明数据可信度。"""
     return query_symbols(query, type)
 
 

@@ -358,17 +358,106 @@ def _is_stale() -> bool:
         return True
 
 
-def _ensure_fresh():
-    """Lazy re-scan: if stale, run incremental scan under lock (non-blocking if already scanning)."""
-    if not _is_stale():
-        return
-    if not _scan_lock.acquire(blocking=False):
-        return  # another thread is already refreshing
+def _detect_dirty_files() -> dict[str, list[str]]:
+    """Find uncommitted source files per project.
+
+    Returns {project_name: [rel_path, ...]} — only projects that have dirty files.
+    """
+    dirty: dict[str, list[str]] = {}
+    for pname in walk_projects():
+        root = Path(db.load_projects().get(pname, {}) .get("root", "")) if pname else Path("")
+        if not root.exists():
+            continue
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(root), "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode != 0:
+                continue
+            files = [f for f in r.stdout.strip().split("\n") if f]
+            files = [f for f in files if any(f.endswith(ext) for ext in SOURCE_EXT)]
+            # also check untracked
+            r2 = subprocess.run(
+                ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r2.returncode == 0:
+                files += [f for f in r2.stdout.strip().split("\n") if f
+                          and any(f.endswith(ext) for ext in SOURCE_EXT)]
+            if files:
+                dirty[pname] = sorted(set(files))
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+    return dirty
+
+
+def _freshness_grade(last_scanned: str | None, dirty_count: int) -> str:
+    """Return freshness rating: 'fresh' | 'partial' | 'unknown'.
+
+    - fresh: scanned within STALE_MINUTES, no dirty files
+    - partial: scanned but stale or has dirty files
+    - unknown: never scanned
+    """
+    if not last_scanned:
+        return "unknown"
     try:
-        if _is_stale():  # double-check after acquiring lock
+        parsed = time.strptime(last_scanned, "%Y-%m-%dT%H:%M:%S")
+        elapsed = time.time() - time.mktime(parsed)
+        if elapsed > STALE_MINUTES * 60:
+            return "partial"
+    except (ValueError, OSError):
+        return "unknown"
+    if dirty_count > 0:
+        return "partial"
+    return "fresh"
+
+
+def _ensure_fresh() -> dict:
+    """Lazy re-scan if stale, return freshness info.
+
+    Returns dict with freshness grade, last_scanned, and dirty file count.
+    """
+    dirty = _detect_dirty_files()
+    dirty_count = sum(len(fs) for fs in dirty.values())
+    last_scanned = db.get_last_scanned()
+    grade = _freshness_grade(last_scanned, dirty_count)
+
+    if grade != "unknown":
+        return {
+            "freshness": grade,
+            "last_scanned": last_scanned,
+            "dirty_projects": len(dirty),
+            "dirty_files": dirty_count,
+            "hint": "",
+        }
+
+    # unknown: trigger scan
+    if not _scan_lock.acquire(blocking=False):
+        return {
+            "freshness": "unknown",
+            "last_scanned": None,
+            "dirty_projects": len(dirty),
+            "dirty_files": dirty_count,
+            "hint": "code graph is being refreshed by another caller; retry in a moment",
+        }
+    try:
+        if _is_stale():
             scan()
     finally:
         _scan_lock.release()
+
+    last_scanned = db.get_last_scanned()
+    dirty = _detect_dirty_files()
+    dirty_count = sum(len(fs) for fs in dirty.values())
+    grade = _freshness_grade(last_scanned, dirty_count)
+    return {
+        "freshness": grade,
+        "last_scanned": last_scanned,
+        "dirty_projects": len(dirty),
+        "dirty_files": dirty_count,
+        "hint": "",
+    }
 
 
 def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
@@ -382,13 +471,18 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
         min_risk: Optional minimum risk level filter ("low", "medium", "high").
 
     Returns:
-        JSON string with impact report.
+        JSON string with impact report including freshness metadata.
     """
-    _ensure_fresh()
+    freshness = _ensure_fresh()
     min_risk = kwargs.get("min_risk")
     edges = db.get_all_edges()
     if not edges:
-        return json.dumps({"seed": target_file, "impacted": [], "summary": "no edges loaded"})
+        return json.dumps({
+            "freshness": freshness,
+            "seed": target_file,
+            "impacted": [],
+            "summary": "no edges loaded",
+        })
 
     known_projects = {e.get("src_project", "") for e in edges if e.get("src_project")}
     known_projects |= {e.get("dst_project", "") for e in edges if e.get("dst_project")}
@@ -408,6 +502,9 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
     impacted_seen: set[str] = set()
     queue: deque[tuple[str, int, list[str]]] = deque(seeds)
     impacted: list[dict] = []
+
+    has_dirty = freshness.get("dirty_files", 0) > 0
+    certainty_base = "overlay-pending" if has_dirty else "matched"
 
     while queue:
         current, depth, path = queue.popleft()
@@ -432,6 +529,7 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
                         "node": {"project": src_p, "file": src_f},
                         "distance": depth + 1,
                         "risk": _risk_score(depth + 1, src_f),
+                        "certainty": certainty_base,
                         "path": new_path,
                         "confidence": e.get("confidence", "extracted"),
                     })
@@ -448,6 +546,7 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
                         "node": {"project": src_p, "file": src_f},
                         "distance": depth + 1,
                         "risk": _risk_score(depth + 1, src_f),
+                        "certainty": certainty_base,
                         "path": new_path,
                         "confidence": e.get("confidence", "extracted"),
                     })
@@ -461,6 +560,7 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
                         "node": {"project": src_p, "file": src_f, "symbol": dst_s},
                         "distance": depth + 1,
                         "risk": _risk_score(depth + 1, src_f),
+                        "certainty": certainty_base,
                         "path": path + [kind],
                         "confidence": e.get("confidence", "extracted"),
                     })
@@ -472,13 +572,23 @@ def trace_impact(target_file: str, max_depth: int = 3, **kwargs) -> str:
         threshold = risk_order[min_risk]
         impacted = [i for i in impacted if risk_order.get(i.get("risk", "low"), 0) >= threshold]
 
+    hint = ""
+    if freshness.get("freshness") == "partial":
+        dirty_projects = freshness.get("dirty_projects", 0)
+        if dirty_projects > 0:
+            hint = (f"Analysis based on committed code. {dirty_projects} project(s) have "
+                    f"uncommitted changes not reflected in edges/symbols. "
+                    f"Consider committing and re-running for full results.")
+
     return json.dumps({
+        "freshness": freshness,
         "seed": target_file,
         "target_project": target_project or "unknown",
         "exported_symbols": [{"name": s["name"], "kind": s["kind"]} for s in exported_symbols],
         "impacted": impacted,
         "summary": f"{len(impacted)} affected nodes across "
-                   f"{len({i['node']['project'] for i in impacted if i['node']['project']})} projects"
+                   f"{len({i['node']['project'] for i in impacted if i['node']['project']})} projects",
+        "hint": hint,
     }, indent=2, ensure_ascii=False)
 
 
@@ -514,11 +624,14 @@ def query_symbols(query: str, query_type: str = "symbol", **kwargs) -> str:
         fuzzy: Enable FTS5 fuzzy search (default true).
 
     Returns:
-        JSON string with query results.
+        JSON string with query results including freshness metadata.
     """
-    _ensure_fresh()
+    freshness = _ensure_fresh()
     results: list[dict] = []
     fuzzy = kwargs.get("fuzzy", True)
+
+    has_dirty = freshness.get("dirty_files", 0) > 0
+    certainty_base = "overlay-pending" if has_dirty else "matched"
 
     if query_type == "symbol":
         if fuzzy:
@@ -528,6 +641,8 @@ def query_symbols(query: str, query_type: str = "symbol", **kwargs) -> str:
                 results = db.search_symbols(query)
         else:
             results = db.search_symbols(query)
+        for r in results:
+            r["certainty"] = certainty_base
 
     elif query_type == "exporter":
         matched = db.search_symbols(query)
@@ -535,6 +650,8 @@ def query_symbols(query: str, query_type: str = "symbol", **kwargs) -> str:
         if files:
             all_syms = db.get_all_symbols()
             results = [s for s in all_syms if s.get("file_path") in files]
+        for r in results:
+            r["certainty"] = certainty_base
 
     elif query_type == "consumer":
         matched = db.search_symbols(query)
@@ -546,15 +663,24 @@ def query_symbols(query: str, query_type: str = "symbol", **kwargs) -> str:
                 "provider": {"project": e["dst_project"], "file": e["dst_file"]},
                 "kind": e["kind"],
                 "detail": e.get("detail", ""),
+                "certainty": certainty_base,
             }
             for e in edges if e.get("dst_file") in files
         ]
 
+    hint = ""
+    if freshness.get("freshness") == "partial" and has_dirty:
+        hint = (f"Results based on scanned commits. {freshness.get('dirty_projects', 0)} "
+                f"project(s) have uncommitted changes not in the index. "
+                f"Commit and re-query for completeness.")
+
     return json.dumps({
+        "freshness": freshness,
         "query": query,
         "type": query_type,
         "count": len(results),
         "results": results,
+        "hint": hint,
     }, indent=2, ensure_ascii=False)
 
 
