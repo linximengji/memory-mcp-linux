@@ -25,7 +25,7 @@ MEMORY_DIR = MEMORY_ROOT
 INDEX_FILE = MEMORY_DIR / "MEMORY.md"
 REVIEW_REPORT = MEMORY_DIR / "review-report.md"
 DISMISSED_FILE = MEMORY_DIR / ".dismissed"
-SECOND_MODEL = os.environ.get("MM_SECOND_MODEL", "qwen3.8-max-preview")
+SECOND_MODEL = os.environ.get("MM_SECOND_MODEL", "qwen3.8-max")
 
 FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 WIKI_RE = re.compile(r"\[\[([^\]]+?)(?:\|[^\]]*)?\]\]")
