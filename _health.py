@@ -10,6 +10,7 @@ Consumed by: _health_cli.py (CLI), daily_report/runner.py (subprocess), MCP tool
 """
 
 import os, re, json, time, urllib.request, sys
+from concurrent.futures import ThreadPoolExecutor
 
 # Allow running from any CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +27,7 @@ INDEX_FILE = MEMORY_DIR / "MEMORY.md"
 REVIEW_REPORT = MEMORY_DIR / "review-report.md"
 DISMISSED_FILE = MEMORY_DIR / ".dismissed"
 SECOND_MODEL = os.environ.get("MM_SECOND_MODEL", "qwen3.8-max")
+_LLM_WORKERS = 5   # 并行 LLM 审计的线程数(urlopen 阻塞 I/O,多线程可真实并发打到 proxy)
 
 FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 WIKI_RE = re.compile(r"\[\[([^\]]+?)(?:\|[^\]]*)?\]\]")
@@ -353,78 +355,70 @@ def _increment_demote_count(path: Path) -> None:
     _atomic_write(path, new_fm + body + "\n")
 
 
+def _deep_audit_entry(fm: dict, guide_text: str) -> dict:
+    """Audit a single entry on 6 dimensions. Pure: builds prompt, calls LLM, parses JSON."""
+    name = fm.get("name", "")
+    age = round(_age_days(fm), 1)
+    body = _strip_audit(fm.get("_body", ""))[:2500]
+
+    sensitive = _sensitive_scan(body)
+    sensitive_note = f"\nNOTE: regex matched {sensitive}" if sensitive else ""
+
+    prompt = (
+        "You are a memory quality auditor. Rate this entry on 6 dimensions.\n"
+        "Do NOT approve by default -- find at least one weakness per entry.\n"
+        "Reply with JSON only.\n\n"
+        "Memory segment definitions:\n"
+        f"{guide_text}\n\n"
+        "Dimensions:\n"
+        "- valid: content is coherent, non-trivial, consistent\n"
+        "- segment_correct: content belongs to the assigned segment (see definitions above)\n"
+        "- recall_oriented: name matches likely search queries\n"
+        "- fact_correct: mentioned function names, file paths, config keys,\n"
+        "  parameters are plausible\n"
+        "- sensitive: contains API keys, passwords, JWT tokens, private keys,\n"
+        "  or other credentials in plaintext\n"
+        "- action: keep|demote|flag\n"
+        "  keep = no issues, demote = needs review, flag = valid but needs fixes\n\n"
+        'JSON: {"valid":bool,"segment_correct":bool,"recall_oriented":bool,\n'
+        '       "fact_correct":bool,"has_sensitive_content":bool,\n'
+        '       "action":"keep"|"demote"|"flag",\n'
+        '       "reason":"short CN reason"}\n\n'
+        f"name: {name}\nns: {fm.get('namespace', '')}\nage: {age}d\n---\n{body}{sensitive_note}"
+    )
+
+    reply = _call_llm(prompt, max_tokens=300, temperature=0.3, timeout=45)
+    if reply.startswith("__LLM_ERROR__"):
+        return {"file": name, "error": reply.split(":", 1)[1]}
+
+    jm = re.search(r"\{[^{}]*\}", reply)
+    if not jm:
+        return {"file": name, "error": "no JSON in LLM response"}
+
+    try:
+        parsed = json.loads(jm.group())
+    except json.JSONDecodeError:
+        return {"file": name, "error": "JSON parse error"}
+
+    action = parsed.get("action", "keep")
+    if action == "keep" and not parsed.get("valid", True):
+        action = "demote"
+
+    return {
+        "file": name,
+        "namespace": fm.get("namespace", ""),
+        "action": action,
+        "has_sensitive": parsed.get("has_sensitive_content", False),
+        "reason": parsed.get("reason", "")[:200],
+    }
+
+
 def _deep_audit(fm_cache: list[dict]) -> list[dict]:
     max_candidates = 15
-    dismissed = _load_dismissed()
     guide_text = _build_segment_guide_text()
-
     candidates = sorted(fm_cache, key=lambda fm: _age_days(fm))[:max_candidates]
-
-    results = []
-    for fm in candidates:
-        name = fm.get("name", "")
-        ns = fm.get("namespace", "")
-        age = round(_age_days(fm), 1)
-        body = _strip_audit(fm.get("_body", ""))[:2500]
-
-        sensitive = _sensitive_scan(body)
-        sensitive_note = f"\nNOTE: regex matched {sensitive}" if sensitive else ""
-
-        prompt = (
-            "You are a memory quality auditor. Rate this entry on 6 dimensions.\n"
-            "Do NOT approve by default -- find at least one weakness per entry.\n"
-            "Reply with JSON only.\n\n"
-            "Memory segment definitions:\n"
-            f"{guide_text}\n\n"
-            "Dimensions:\n"
-            "- valid: content is coherent, non-trivial, consistent\n"
-            "- segment_correct: content belongs to the assigned segment (see definitions above)\n"
-            "- recall_oriented: name matches likely search queries\n"
-            "- fact_correct: mentioned function names, file paths, config keys,\n"
-            "  parameters are plausible\n"
-            "- sensitive: contains API keys, passwords, JWT tokens, private keys,\n"
-            "  or other credentials in plaintext\n"
-            "- action: keep|demote|flag\n"
-            "  keep = no issues, demote = needs review, flag = valid but needs fixes\n\n"
-            'JSON: {"valid":bool,"segment_correct":bool,"recall_oriented":bool,\n'
-            '       "fact_correct":bool,"has_sensitive_content":bool,\n'
-            '       "action":"keep"|"demote"|"flag",\n'
-            '       "reason":"short CN reason"}\n\n'
-            f"name: {name}\nns: {ns}\nage: {age}d\n---\n{body}{sensitive_note}"
-        )
-
-        reply = _call_llm(prompt, max_tokens=300, temperature=0.3, timeout=45)
-        if reply.startswith("__LLM_ERROR__"):
-            results.append({"file": name, "error": reply.split(":", 1)[1]})
-            continue
-
-        jm = re.search(r"\{[^{}]*\}", reply)
-        if not jm:
-            results.append({"file": name, "error": "no JSON in LLM response"})
-            continue
-
-        try:
-            parsed = json.loads(jm.group())
-        except json.JSONDecodeError:
-            results.append({"file": name, "error": "JSON parse error"})
-            continue
-
-        action = parsed.get("action", "keep")
-        has_sensitive = parsed.get("has_sensitive_content", False)
-        reason = parsed.get("reason", "")[:200]
-
-        if action == "keep" and not parsed.get("valid", True):
-            action = "demote"
-
-        results.append({
-            "file": name,
-            "namespace": ns,
-            "action": action,
-            "has_sensitive": has_sensitive,
-            "reason": reason,
-        })
-
-    return results
+    with ThreadPoolExecutor(max_workers=_LLM_WORKERS) as ex:
+        return list(ex.map(_deep_audit_entry, candidates, [guide_text] * len(candidates)))
 
 
 def _consolidation_pass(fm_cache: list[dict]) -> list[dict]:
@@ -710,49 +704,47 @@ def _verify_file_paths(fm_cache: list[dict]) -> list[dict]:
     return results
 
 
+def _single_model_audit_entry(fm: dict, model: str, guide_text: str) -> dict:
+    name = fm.get("name", "")
+    age = round(_age_days(fm), 1)
+    body = _strip_audit(fm.get("_body", ""))[:2500]
+    sensitive_note = ""
+
+    prompt = (
+        "You are a memory quality auditor. Rate this entry.\n"
+        "Do NOT approve by default.\nReply with JSON only.\n\n"
+        "Memory segment definitions:\n"
+        f"{guide_text}\n\n"
+        "Dimensions:\n"
+        "- valid: content is coherent, non-trivial, consistent\n"
+        "- segment_correct: content belongs to the assigned segment\n"
+        "- action: keep|demote|flag\n"
+        'JSON: {"valid":bool,"segment_correct":bool,"action":"keep"|"demote"|"flag","reason":"short CN reason"}\n\n'
+        f"name: {name}\nns: {fm.get('namespace', '')}\nage: {age}d\n---\n{body}{sensitive_note}"
+    )
+
+    reply = _call_llm(prompt, model=model, max_tokens=300, temperature=0.3, timeout=45)
+    if reply.startswith("__LLM_ERROR__"):
+        return {"file": name, "error": reply.split(":", 1)[1]}
+    jm = re.search(r"\{[^{}]*\}", reply)
+    if not jm:
+        return {"file": name, "error": "no JSON"}
+    try:
+        parsed = json.loads(jm.group())
+    except json.JSONDecodeError:
+        return {"file": name, "error": "JSON parse"}
+    action = parsed.get("action", "keep")
+    if action == "keep" and not parsed.get("valid", True):
+        action = "demote"
+    return {"file": name, "action": action, "reason": parsed.get("reason", "")[:200]}
+
+
 def _run_single_model_audit(candidates: list[dict], model: str) -> list[dict]:
     guide_text = _build_segment_guide_text()
-    results = []
-    for fm in candidates:
-        name = fm.get("name", "")
-        ns = fm.get("namespace", "")
-        age = round(_age_days(fm), 1)
-        body = _strip_audit(fm.get("_body", ""))[:2500]
-        sensitive = _sensitive_scan(body)
-        sensitive_note = f"\nNOTE: regex matched {sensitive}" if sensitive else ""
-
-        prompt = (
-            "You are a memory quality auditor. Rate this entry.\n"
-            "Do NOT approve by default.\nReply with JSON only.\n\n"
-            "Memory segment definitions:\n"
-            f"{guide_text}\n\n"
-            "Dimensions:\n"
-            "- valid: content is coherent, non-trivial, consistent\n"
-            "- segment_correct: content belongs to the assigned segment\n"
-            "- action: keep|demote|flag\n"
-            'JSON: {"valid":bool,"segment_correct":bool,"action":"keep"|"demote"|"flag","reason":"short CN reason"}\n\n'
-            f"name: {name}\nns: {ns}\nage: {age}d\n---\n{body}{sensitive_note}"
-        )
-
-        reply = _call_llm(prompt, model=model, max_tokens=300, temperature=0.3, timeout=45)
-        if reply.startswith("__LLM_ERROR__"):
-            results.append({"file": name, "error": reply.split(":", 1)[1]})
-            continue
-        jm = re.search(r"\{[^{}]*\}", reply)
-        if not jm:
-            results.append({"file": name, "error": "no JSON"})
-            continue
-        try:
-            parsed = json.loads(jm.group())
-        except json.JSONDecodeError:
-            results.append({"file": name, "error": "JSON parse"})
-            continue
-        action = parsed.get("action", "keep")
-        reason = parsed.get("reason", "")[:200]
-        if action == "keep" and not parsed.get("valid", True):
-            action = "demote"
-        results.append({"file": name, "action": action, "reason": reason})
-    return results
+    with ThreadPoolExecutor(max_workers=_LLM_WORKERS) as ex:
+        return list(ex.map(
+            _single_model_audit_entry,
+            candidates, [model] * len(candidates), [guide_text] * len(candidates)))
 
 
 def _multi_model_audit(fm_cache: list[dict],
@@ -1173,12 +1165,19 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
     }
 
     if llm_enabled:
-        audit_results = _deep_audit(fm_cache)
-        consolidations = _consolidation_pass(fm_cache)
+        # 互不依赖的 LLM 阶段并行(deep/consolidation/contradiction 只读内存快照 fm_cache)。
+        # multi_model_audit 依赖 deep 结果,单独在其后跑。
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            fut_deep = ex.submit(_deep_audit, fm_cache)
+            fut_consol = ex.submit(_consolidation_pass, fm_cache)
+            fut_contr = ex.submit(_detect_contradictions, fm_cache)
+            audit_results = fut_deep.result()
+            consolidations = fut_consol.result()
+            contradictions = fut_contr.result()
         result["audit_results"] = audit_results
         result["flag_items"] = [r for r in audit_results if r.get("action") == "flag"]
         result["consolidations"] = consolidations
-        result["contradictions"] = _detect_contradictions(fm_cache)
+        result["contradictions"] = contradictions
         result["completeness_issues"] = _check_completeness(fm_cache, max_items=10)
         result["path_issues"] = _verify_file_paths(fm_cache)
         result["model_disagreements"] = _multi_model_audit(fm_cache, flash_results=audit_results)
