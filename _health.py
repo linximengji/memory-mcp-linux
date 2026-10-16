@@ -1041,8 +1041,8 @@ def format_html(result: dict) -> str:
 
     if consolidations:
         c_rows = "".join(
-            f'<tr><td class="mem-name">{c["source"][:20]}</td>'
-            f'<td class="mem-name">{c["target"][:20]}</td>'
+            f'<tr><td class="mem-name">{(c.get("source") or "—")[:20]}</td>'
+            f'<td class="mem-name">{(c.get("target") or "—")[:20]}</td>'
             f'<td style="font-size:12px;color:#636e72">'
             f'{(c.get("reason") or c.get("error",""))[:60]}</td></tr>\n'
             for c in consolidations[:5]
@@ -1056,8 +1056,8 @@ def format_html(result: dict) -> str:
 
     if contradictions:
         x_rows = "".join(
-            f'<tr><td class="mem-name">{c["source"][:20]}</td>'
-            f'<td class="mem-name">{c["target"][:20]}</td>'
+            f'<tr><td class="mem-name">{(c.get("source") or "—")[:20]}</td>'
+            f'<td class="mem-name">{(c.get("target") or "—")[:20]}</td>'
             f'<td style="font-size:12px;color:#d63031">{c.get("topic","")[:40]}</td>'
             f'<td style="font-size:12px;color:#636e72">{c.get("claim1","")[:40]} vs {c.get("claim2","")[:40]}</td></tr>\n'
             for c in contradictions
