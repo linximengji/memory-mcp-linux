@@ -1,9 +1,14 @@
 """Verify memory-mcp storage CRUD and search (simplified frontmatter)."""
-import sys, os, time, re, json, urllib.request
+import sys, os, time, re, json, urllib.request, tempfile, shutil
 sys.path.insert(0, os.path.dirname(__file__))
 sys.stdout.reconfigure(encoding='utf-8')
 
 from pathlib import Path
+
+# isolate from the real store before _storage resolves MEMORY_ROOT at import time
+_TEST_ROOT = tempfile.mkdtemp(prefix="memory-mcp-test-")
+os.environ["MM_WORKSPACE_ROOT"] = _TEST_ROOT
+(Path(_TEST_ROOT) / ".claude" / "memory").mkdir(parents=True)
 import _storage as s
 
 passed = 0
@@ -23,6 +28,33 @@ TEST_NS = "memory-mcp"
 def write_test_mem(name, path, content, namespace=TEST_NS, segment="_index"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"---\nname: {name}\n---\n\n{content}\n", encoding="utf-8")
+
+class FakeRerankServer:
+    """Local /v1/messages stand-in so rerank parsing is tested without the real proxy."""
+    def __init__(self, reply):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        body = json.dumps({"content": [{"type": "text", "text": reply}]}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+
+        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}/v1/messages"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 # ── memory_store + memory_delete ──
 print("── memory_store & delete ──")
@@ -76,12 +108,82 @@ check("body hit scores 0.9 * namespace_boost", abs(score_body - 0.9 * 1.2) < 0.0
 
 # ── memory_recall ──
 print("── memory_recall ──")
+for _i, _ns in enumerate(["seed-a", "seed-b", "seed-c"]):
+    write_test_mem(f"seed-{_i}", s.MEMORY_ROOT / _ns / f"seed-{_i}.md",
+                   "seed content for recall ordering", namespace=_ns)
 r_empty = s.memory_recall("", top_k=5)
-check("empty query returns results", len(r_empty) > 0, f"got {len(r_empty)}")
-check("results have name/score", "name" in r_empty[0] and "score" in r_empty[0], str(r_empty[0])[:200])
+check("empty query returns results", len(r_empty["results"]) > 0, f"got {len(r_empty)}")
+check("results have name/score", "name" in r_empty["results"][0] and "score" in r_empty["results"][0], str(r_empty["results"][0])[:200])
+check("empty query coverage complete", r_empty["coverage"]["status"] == "complete", str(r_empty["coverage"]))
+check("coverage has scope", "scope" in r_empty["coverage"], str(r_empty["coverage"]))
+check("format renders no-match line", "no matches" in s.format_recall_text({"results": [], "coverage": {"status": "complete", "scope": "all", "reason": "x"}}))
+check("format renders unknown line", "coverage=unknown" in s.format_recall_text({"results": [], "coverage": {"status": "unknown", "scope": "ns", "reason": "y"}}))
+
+# ── memory_recall coverage ──
+print("── memory_recall coverage ──")
+cov_ns = f"cov-{UNIQ}"
+cov_file = s.MEMORY_ROOT / cov_ns / "only-one.md"
+write_test_mem("only-one", cov_file, "coverage probe content", namespace=cov_ns)
+# a single candidate short-circuits the reranker, so parsing tests need two
+cov_file2 = s.MEMORY_ROOT / cov_ns / "second.md"
+write_test_mem("second", cov_file2, "second probe content", namespace=cov_ns)
+orig_rerank = s._llm_rerank
+try:
+    s._llm_rerank = lambda q, c, k: []
+    r = s.memory_recall("zzz-no-such-token", namespace=cov_ns)
+    check("complete + no hit returns empty results", r["results"] == [], str(r))
+    check("complete + no hit coverage complete", r["coverage"]["status"] == "complete", str(r["coverage"]))
+
+    s._llm_rerank = lambda q, c, k: None
+    r = s.memory_recall("zzz-no-such-token", namespace=cov_ns)
+    check("rerank failure coverage unknown", r["coverage"]["status"] == "unknown", str(r["coverage"]))
+    check("rerank failure reason mentions fallback", "fallback" in r["coverage"]["reason"], str(r["coverage"]))
+
+    # global memories are visible in every scope, so a missing namespace is only
+    # truly empty when no global memories exist
+    has_global = any(m["namespace"] == "global" for m in s._iter_memories())
+    s._llm_rerank = lambda q, c, k: []
+    r = s.memory_recall("anything", namespace=f"missing-{UNIQ}")
+    expected = "complete" if has_global else "unknown"
+    check(f"missing scope coverage {expected}", r["coverage"]["status"] == expected, str(r["coverage"]))
+    if not has_global:
+        check("empty scope returns no results", r["results"] == [], str(r))
+
+    # reranker NONE = judged irrelevant (complete), unparseable = failure (unknown)
+    s._llm_rerank = orig_rerank
+    orig_proxy = s.PROXY_URL
+    for reply, label in [("NONE", "complete"), ("garbage reply", "unknown")]:
+        srv = FakeRerankServer(reply)
+        s.PROXY_URL = srv.url
+        try:
+            r = s.memory_recall("zzz-no-such-token", namespace=cov_ns)
+        finally:
+            srv.close()
+            s.PROXY_URL = orig_proxy
+        check(f"reply {reply!r} coverage {label}", r["coverage"]["status"] == label, str(r["coverage"]))
+        if label == "complete":
+            check("NONE reply yields no results", r["results"] == [], str(r))
+        else:
+            check("unparseable reply marks fallback", "fallback" in r["coverage"]["reason"], str(r["coverage"]))
+finally:
+    s._llm_rerank = orig_rerank
+    cov_file.unlink()
+    cov_file2.unlink()
+
+# ── _shortlist ──
+print("── _shortlist ──")
+big = [{"name": f"filler-{i}", "content": "unrelated filler text", "namespace": TEST_NS}
+       for i in range(60)]
+target = {"name": "kimi-rate-calibration", "content": "kimi coefficient was overstated by 30 percent",
+          "namespace": TEST_NS}
+short = s._shortlist("kimi 系数", big + [target], limit=10)
+check("shortlist caps size", len(short) <= 10, f"got {len(short)}")
+check("shortlist keeps keyword hit", target in short, str([m["name"] for m in short]))
+check("shortlist passthrough under limit", s._shortlist("x", big[:5], limit=10) == big[:5])
 
 # ── MEMORY.md rebuild ──
 print("── MEMORY.md rebuild ──")
+write_test_mem("_index", s.MEMORY_ROOT / TEST_NS / "_index.md", "index fixture", namespace=TEST_NS)
 s.memory_rebuild_index()
 idx = (s.MEMORY_ROOT / "MEMORY.md").read_text(encoding="utf-8")
 check("has entries", len(idx.splitlines()) > 5)
@@ -205,6 +307,7 @@ check("review list empty after dismiss", not r_list3 or "no pending" in r_list3,
 # cleanup
 if rev_path.exists():
     rev_path.unlink()
+shutil.rmtree(_TEST_ROOT, ignore_errors=True)
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(0 if failed == 0 else 1)

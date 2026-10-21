@@ -249,8 +249,8 @@ def _keyword_score(query: str, mem: dict, pid: str | None) -> float:
     elif ql in body:
         score = 0.9
     else:
-        tokens = [t for t in re.split(r"[\s,，.。、/\\\-_()（）]+", ql) if t and len(t) >= 2]
-        best = 0.1
+        tokens = [t for t in re.split(r"[\s,，.。、/\\\-_（）()]+", ql) if t and len(t) >= 2]
+        best = 0.0
         for tok in tokens:
             if tok in name:
                 best = max(best, 1.0)
@@ -262,19 +262,32 @@ def _keyword_score(query: str, mem: dict, pid: str | None) -> float:
     return score * boost
 
 
+def _shortlist(query: str, candidates: list[dict], limit: int = 40) -> list[dict]:
+    """Keyword pre-filter so the reranker never sees the whole store at once."""
+    if len(candidates) <= limit:
+        return candidates
+    scored = sorted(candidates, key=lambda m: -_keyword_score(query, m, None))
+    return scored[:limit]
+
+
 def _llm_rerank(query: str, candidates: list[dict], top_k: int) -> list[tuple[float, dict]] | None:
+    candidates = _shortlist(query, candidates)
     if not candidates:
         return None
     if len(candidates) == 1:
         return [(1.0, candidates[0])]
     items = [
-        f"{i}. {mem['name']} [{mem.get('namespace','?')}] - {mem['content'][:80]}"
+        f"{i}. {mem['name']} [{mem.get('namespace','?')}] - {mem['content'][:120]}"
         for i, mem in enumerate(candidates)
     ]
     prompt = (
-        f"Which are most relevant to \"{query}\"?\n"
+        f"Query: \"{query}\"\n"
+        "Match by meaning, not exact wording: translate between Chinese and English, "
+        "expand abbreviations, and treat related terms as relevant.\n"
         + "\n".join(items)
-        + "\n\nAnswer with ONLY the item numbers in order, like: 0,1"
+        + "\n\nAnswer with ONLY the numbers of items that help answer the query, "
+        "most relevant first, like: 0,1"
+        "\nAnswer exactly NONE only if truly nothing is related."
     )
     try:
         payload = json.dumps({
@@ -299,6 +312,10 @@ def _llm_rerank(query: str, candidates: list[dict], top_k: int) -> list[tuple[fl
         print(f"[memory_recall] LLM rerank failed ({type(e).__name__}: {e}), falling back to keyword scoring", file=sys.stderr)
         return None
 
+    # "NONE" means the reranker judged every candidate irrelevant; that is a real
+    # empty answer (coverage complete), distinct from a failed call (None → fallback)
+    if text.strip().strip(".,，。!").upper() == "NONE":
+        return []
     indices = [int(tok.rstrip(".")) for tok in re.split(r"[,，\s]+", text) if tok.strip().rstrip(".").isdigit()]
     ranked = []
     seen = set()
@@ -463,26 +480,41 @@ def memory_update(name: str, content: str | None = None,
 
 
 def memory_recall(query: str = "", namespace: str | None = None,
-                   top_k: int = 5) -> list[dict]:
-    """Search memories by query. Returns list of dicts with score, name, namespace, segment."""
+                   top_k: int = 5) -> dict:
+    """Search memories by query. Returns {results, coverage: {status, scope, reason}}.
+
+    coverage.status "complete" = the reranker ran and judged (keyword-shortlisted
+    when the scope is large); "unknown" = the reranker failed or the scope was
+    empty, so an empty result proves nothing.
+    """
     pid = _detect_namespace()
     candidates = []
+    scope = namespace or "all"
     for mem in _iter_memories():
         if namespace and mem["namespace"] != namespace and mem["namespace"] != "global":
             continue
         candidates.append(mem)
 
     if not candidates:
-        return []
+        return {
+            "results": [],
+            "coverage": {
+                "status": "unknown", "scope": scope,
+                "reason": f"no memories exist in scope '{scope}'"
+                if namespace else "memory store is empty",
+            },
+        }
 
     if query:
         ranked = _llm_rerank(query, candidates, top_k)
-        if ranked is None:
+        degraded = ranked is None
+        if degraded:
             ranked = sorted(
                 ((_keyword_score(query, m, pid), m) for m in candidates),
                 key=lambda x: -x[0],
             )
     else:
+        degraded = False
         ranked = []
         for mem in candidates:
             score = 1.0
@@ -500,19 +532,38 @@ def memory_recall(query: str = "", namespace: str | None = None,
     if query:
         ranked = _expand_via_links(ranked, top_k)
 
-    return [
-        {"name": m["name"], "namespace": m["namespace"],
-         "segment": m["segment"], "score": round(score, 3)}
-        for score, m in ranked
-    ]
+    if degraded:
+        coverage = {"status": "unknown", "scope": scope,
+                    "reason": "reranker unavailable; keyword fallback may miss semantic matches"}
+    else:
+        coverage = {"status": "complete", "scope": scope,
+                    "reason": f"{len(candidates)} candidate(s) in scope"}
+
+    return {
+        "results": [
+            {"name": m["name"], "namespace": m["namespace"],
+             "segment": m["segment"], "score": round(score, 3)}
+            for score, m in ranked
+        ],
+        "coverage": coverage,
+    }
 
 
-def format_recall_text(results: list[dict]) -> str:
-    """Format list[dict] from memory_recall() into human-readable text."""
-    return "\n".join(
+def format_recall_text(result: dict | list[dict]) -> str:
+    """Format memory_recall() output into human-readable text."""
+    if isinstance(result, list):
+        result = {"results": result, "coverage": {"status": "unknown", "scope": "all",
+                                                  "reason": "legacy result without coverage"}}
+    lines = [
         f"- [{r['name']}] [{r['namespace']}] seg={r['segment']} score={r['score']}"
-        for r in results
-    )
+        for r in result["results"]
+    ]
+    cov = result["coverage"]
+    if cov["status"] != "complete":
+        lines.append(f"coverage=unknown scope={cov['scope']}: {cov['reason']}")
+    elif not lines:
+        lines.append(f"no matches (scope={cov['scope']}, coverage=complete)")
+    return "\n".join(lines)
 
 
 def memory_get(name: str, namespace: str | None = None) -> str:
