@@ -28,6 +28,7 @@ REVIEW_REPORT = MEMORY_DIR / "review-report.md"
 DISMISSED_FILE = MEMORY_DIR / ".dismissed"
 SECOND_MODEL = os.environ.get("MM_SECOND_MODEL", "qwen3.8-max")
 _LLM_WORKERS = 5   # 并行 LLM 审计的线程数(urlopen 阻塞 I/O,多线程可真实并发打到 proxy)
+_LLM_RETRIES = 2   # flash 偶发 403,单次调用带退避重试
 
 FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 WIKI_RE = re.compile(r"\[\[([^\]]+?)(?:\|[^\]]*)?\]\]")
@@ -90,33 +91,41 @@ def _age_days(fm: dict) -> float:
     return age
 
 
+def _call_llm_once(payload: bytes, timeout: int) -> str:
+    req = urllib.request.Request(
+        PROXY_URL,
+        data=payload,
+        headers={"Content-Type": "application/json",
+                 "x-api-key": "sk-memory-health",
+                 "anthropic-version": "2023-06-01"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return "".join(
+            block.get("text", "") for block in data.get("content", [])
+            if block.get("type") == "text"
+        ).strip()
+
+
 def _call_llm(prompt: str, model: str = LLM_MODEL,
               max_tokens: int = 500, temperature: float = 0.3, timeout: int = 30) -> str:
-    try:
-        payload = json.dumps({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "thinking": {"type": "enabled"},
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            PROXY_URL,
-            data=payload,
-            headers={"Content-Type": "application/json",
-                     "x-api-key": "sk-memory-health",
-                     "anthropic-version": "2023-06-01"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            text = "".join(
-                block.get("text", "") for block in data.get("content", [])
-                if block.get("type") == "text"
-            ).strip()
-        return text
-    except Exception as e:
-        return f"__LLM_ERROR__:{e}"
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "thinking": {"type": "enabled"},
+    }).encode("utf-8")
+    err = ""
+    for attempt in range(_LLM_RETRIES + 1):
+        try:
+            return _call_llm_once(payload, timeout)
+        except Exception as e:
+            err = str(e)
+            if attempt < _LLM_RETRIES:
+                time.sleep(2 * (attempt + 1))
+    return f"__LLM_ERROR__:{err}"
 
 
 # ═══════════════════════════════════════════════════════
@@ -483,7 +492,7 @@ def _consolidation_pass(fm_cache: list[dict]) -> list[dict]:
 
     reply = _call_llm(prompt, max_tokens=500, temperature=0.2, timeout=60)
     if reply.startswith("__LLM_ERROR__"):
-        return [{"error": reply.split(":", 1)[1]}]
+        return []
 
     am = re.search(r"\[.*?\]", reply, re.DOTALL)
     if not am:
@@ -592,7 +601,7 @@ def _detect_contradictions(fm_cache: list[dict]) -> list[dict]:
 
     reply = _call_llm("\n".join(prompt_lines), max_tokens=800, temperature=0.2, timeout=60)
     if reply.startswith("__LLM_ERROR__"):
-        return [{"error": reply.split(":", 1)[1]}]
+        return []
 
     am = re.search(r"\[.*?\]", reply, re.DOTALL)
     if not am:
@@ -755,10 +764,15 @@ def _multi_model_audit(fm_cache: list[dict],
 
     candidates = sorted(fm_cache, key=lambda fm: _age_days(fm))[:15]
 
-    qwen_results = _run_single_model_audit(candidates, SECOND_MODEL)
+    flash_results = [r for r in flash_results if "error" not in r]
+    if not flash_results:
+        return []
+    logged = {r["file"] for r in flash_results}
+    qwen_results = _run_single_model_audit(
+        [fm for fm in candidates if fm["name"] in logged], SECOND_MODEL)
 
     flash_by_name = {r["file"]: r for r in flash_results}
-    qwen_by_name = {r["file"]: r for r in qwen_results}
+    qwen_by_name = {r["file"]: r for r in qwen_results if "error" not in r}
     disagreements = []
     for fname, flash_r in flash_by_name.items():
         qwen_r = qwen_by_name.get(fname)
@@ -918,11 +932,20 @@ def _write_review_json(flagged: list[dict], all_issues: list[dict] | None = None
             name = issue.get("name") or issue.get("file", "")
             if name in dismissed:
                 continue
+            action = issue.get("check", "issue")
+            if action == "completeness":
+                detail = "缺 " + "、".join(issue.get("missing_elements", []))
+            elif action == "multi_model_disagreement":
+                detail = (f"{issue.get('flash_action', '?')} vs "
+                          f"{issue.get('qwen_action', '?')}: "
+                          f"{issue.get('flash_reason') or issue.get('qwen_reason', '')}")
+            else:
+                detail = issue.get("detail", "")
             pending.append({
                 "name": name,
                 "namespace": issue.get("ns", ""),
-                "action": issue.get("check", "issue"),
-                "reason": str(issue.get("detail", ""))[:120],
+                "action": action,
+                "reason": str(detail)[:120],
             })
     _atomic_write(REVIEW_JSON, json.dumps(pending, ensure_ascii=False, indent=2) + "\n")
 
@@ -994,12 +1017,18 @@ def format_html(result: dict) -> str:
         )
 
     audit_results = result.get("audit_results", [])
+    audit_errors = sum(1 for r in audit_results if "error" in r)
+    audit_results = [r for r in audit_results if "error" not in r]
     flag_items = result.get("flag_items", [])
     consolidations = result.get("consolidations", [])
     contradictions = result.get("contradictions", [])
     completeness_issues = result.get("completeness_issues", [])
     path_issues = result.get("path_issues", [])
     model_disagreements = result.get("model_disagreements", [])
+
+    if audit_errors:
+        parts.insert(0, f'<p style="font-size:12px;color:#e17055;margin:2px 0">'
+                        f'审计未完成：{audit_errors} 条 LLM 调用失败，已排除</p>')
 
     auto_items = [r for r in audit_results if r.get("action") in ("keep", "demote", None)]
 
