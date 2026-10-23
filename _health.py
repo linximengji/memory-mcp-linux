@@ -364,8 +364,8 @@ def _increment_demote_count(path: Path) -> None:
     _atomic_write(path, new_fm + body + "\n")
 
 
-def _deep_audit_entry(fm: dict, guide_text: str) -> dict:
-    """Audit a single entry on 6 dimensions. Pure: builds prompt, calls LLM, parses JSON."""
+def _build_audit_prompt(fm: dict, guide_text: str) -> str:
+    """Shared prompt for every auditor model, so cross-model comparison is like-for-like."""
     name = fm.get("name", "")
     age = round(_age_days(fm), 1)
     body = _strip_audit(fm.get("_body", ""))[:2500]
@@ -373,9 +373,10 @@ def _deep_audit_entry(fm: dict, guide_text: str) -> dict:
     sensitive = _sensitive_scan(body)
     sensitive_note = f"\nNOTE: regex matched {sensitive}" if sensitive else ""
 
-    prompt = (
+    return (
         "You are a memory quality auditor. Rate this entry on 6 dimensions.\n"
-        "Do NOT approve by default -- find at least one weakness per entry.\n"
+        "Judge only what the text shows. Do not assume a fact is wrong just because\n"
+        "this entry does not supply evidence for it.\n"
         "Reply with JSON only.\n\n"
         "Memory segment definitions:\n"
         f"{guide_text}\n\n"
@@ -396,30 +397,41 @@ def _deep_audit_entry(fm: dict, guide_text: str) -> dict:
         f"name: {name}\nns: {fm.get('namespace', '')}\nage: {age}d\n---\n{body}{sensitive_note}"
     )
 
-    reply = _call_llm(prompt, max_tokens=300, temperature=0.3, timeout=45)
-    if reply.startswith("__LLM_ERROR__"):
-        return {"file": name, "error": reply.split(":", 1)[1]}
 
+def _parse_audit_reply(reply: str) -> dict | None:
     jm = re.search(r"\{[^{}]*\}", reply)
     if not jm:
-        return {"file": name, "error": "no JSON in LLM response"}
-
+        return None
     try:
-        parsed = json.loads(jm.group())
+        return json.loads(jm.group())
     except json.JSONDecodeError:
-        return {"file": name, "error": "JSON parse error"}
+        return None
 
+
+def _audit_verdict(fm: dict, parsed: dict) -> dict:
     action = parsed.get("action", "keep")
     if action == "keep" and not parsed.get("valid", True):
         action = "demote"
-
     return {
-        "file": name,
+        "file": fm.get("name", ""),
         "namespace": fm.get("namespace", ""),
         "action": action,
         "has_sensitive": parsed.get("has_sensitive_content", False),
         "reason": parsed.get("reason", "")[:200],
     }
+
+
+def _deep_audit_entry(fm: dict, guide_text: str) -> dict:
+    """Audit a single entry with the primary model. Pure: builds prompt, calls LLM, parses JSON."""
+    name = fm.get("name", "")
+    reply = _call_llm(_build_audit_prompt(fm, guide_text), max_tokens=300, temperature=0.3, timeout=45)
+    if reply.startswith("__LLM_ERROR__"):
+        return {"file": name, "error": reply.split(":", 1)[1]}
+
+    parsed = _parse_audit_reply(reply)
+    if parsed is None:
+        return {"file": name, "error": "no JSON in LLM response"}
+    return _audit_verdict(fm, parsed)
 
 
 def _deep_audit(fm_cache: list[dict]) -> list[dict]:
@@ -619,28 +631,28 @@ def _check_completeness(fm_cache: list[dict], max_items: int = 10) -> list[dict]
     Prioritizes by: 1) sop/deps/design (operational impact), 2) most missing elements."""
     REQUIRED: dict[str, list[tuple]] = {
         "_index": [
-            (r"(描述|简介|概述|项目|what|是什么)", "项目描述"),
-            (r"(功能|能力|用途|purpose|负责|职责)", "功能/用途"),
+            (r"(描述|简介|概述|是什么|what)", "项目描述"),
+            (r"(功能|能力|用途|负责|职责|负责|purpose)", "功能/用途"),
         ],
         "overview": [
-            (r"(范围|scope|组件|component|模块)", "范围/组件"),
-            (r"(流程|数据流|data.?flow|调用链|链路)", "数据流/流程"),
+            (r"(范围|scope|组件|模块|入口|分层|component)", "范围/组件"),
+            (r"(流程|数据流|调用链|链路|拓扑|data.?flow)", "数据流/流程"),
         ],
         "deps": [
-            (r"(依赖|依赖方|被.*?依赖|调用|使用.*?服务)", "依赖方"),
-            (r"(接口|API|端口|URL|路径|topic|endpoint)", "接口"),
-            (r"(影响|后果|如果.*?断|当.*?不可用|失败)", "影响范围"),
+            (r"(依赖|被.*?依赖|调用|使用|依赖方)", "依赖方"),
+            (r"(接口|API|端口|URL|endpoint|topic)", "接口"),
+            (r"(影响|后果|失败|不可用|断开|降级|如果.*?断)", "影响范围"),
         ],
         "design": [
-            (r"(为什么|原因|背景|动机|目的|decision|决策)", "决策原因"),
-            (r"(方案|设计|架构|结构|备选|替代|alternative|权衡|trade.?off)", "方案/权衡"),
-            (r"(约束|局限|条件|限制|前提|resource|time|scope)", "约束条件"),
-            (r"(脆弱|薄弱|风险|弱点|脆弱点|易出问题)", "已知脆弱点"),
+            (r"(原因|因为|由于|为了|所以|目的|动机|决策|背景|why)", "决策原因"),
+            (r"(方案|设计|架构|结构|替代|权衡|取舍|trade.?off|(选|否|放弃))", "方案/权衡"),
+            (r"(约束|局限|限制|前提|条件|取舍)", "约束条件"),
+            (r"(脆弱|薄弱|风险|弱点|易出问题)", "已知脆弱点"),
         ],
         "sop": [
-            (r"(触发|条件|如果.*?时|当.*?时|在.*?情况下)", "触发条件"),
-            (r"(原因|根因|为什么|因为|由于|导致|表现为)", "根因解释"),
-            (r"(诊断|排查|检查|查.*?看.*?看|怎么.*?判断|判断)", "诊断思路"),
+            (r"(后|之后|时|如果|当|在|一旦|每次|每当|触发)", "触发条件"),
+            (r"(原因|根因|因为|由于|导致|表现为|症状|报错|错误|返回)", "根因解释"),
+            (r"(验证|排查|检查|确认|判断|怎么|如何|诊断)", "诊断思路"),
         ],
     }
 
@@ -715,37 +727,14 @@ def _verify_file_paths(fm_cache: list[dict]) -> list[dict]:
 
 def _single_model_audit_entry(fm: dict, model: str, guide_text: str) -> dict:
     name = fm.get("name", "")
-    age = round(_age_days(fm), 1)
-    body = _strip_audit(fm.get("_body", ""))[:2500]
-    sensitive_note = ""
-
-    prompt = (
-        "You are a memory quality auditor. Rate this entry.\n"
-        "Do NOT approve by default.\nReply with JSON only.\n\n"
-        "Memory segment definitions:\n"
-        f"{guide_text}\n\n"
-        "Dimensions:\n"
-        "- valid: content is coherent, non-trivial, consistent\n"
-        "- segment_correct: content belongs to the assigned segment\n"
-        "- action: keep|demote|flag\n"
-        'JSON: {"valid":bool,"segment_correct":bool,"action":"keep"|"demote"|"flag","reason":"short CN reason"}\n\n'
-        f"name: {name}\nns: {fm.get('namespace', '')}\nage: {age}d\n---\n{body}{sensitive_note}"
-    )
-
-    reply = _call_llm(prompt, model=model, max_tokens=300, temperature=0.3, timeout=45)
+    reply = _call_llm(_build_audit_prompt(fm, guide_text), model=model,
+                      max_tokens=300, temperature=0.3, timeout=45)
     if reply.startswith("__LLM_ERROR__"):
         return {"file": name, "error": reply.split(":", 1)[1]}
-    jm = re.search(r"\{[^{}]*\}", reply)
-    if not jm:
+    parsed = _parse_audit_reply(reply)
+    if parsed is None:
         return {"file": name, "error": "no JSON"}
-    try:
-        parsed = json.loads(jm.group())
-    except json.JSONDecodeError:
-        return {"file": name, "error": "JSON parse"}
-    action = parsed.get("action", "keep")
-    if action == "keep" and not parsed.get("valid", True):
-        action = "demote"
-    return {"file": name, "action": action, "reason": parsed.get("reason", "")[:200]}
+    return _audit_verdict(fm, parsed)
 
 
 def _run_single_model_audit(candidates: list[dict], model: str) -> list[dict]:
