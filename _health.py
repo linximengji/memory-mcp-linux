@@ -248,6 +248,29 @@ def _compute_stats(fm_cache: list[dict]) -> dict:
     }
 
 
+def _count_completeness(fm_cache: list[dict]) -> int:
+    """Count all completeness findings (display shows only the top N). Same rules as _check_completeness."""
+    total = 0
+    for fm in fm_cache:
+        seg = fm.get("segment", "")
+        rules = _COMPLETENESS_REQUIRED.get(seg)
+        body = fm.get("_body", "")
+        if not rules or not body:
+            continue
+        if any(not re.search(pat, body, re.IGNORECASE) for pat, _ in rules):
+            total += 1
+    return total
+
+
+_DESC_MIN_LEN = 8  # description 是召回的首要依据，空/占位描述等于这条记忆搜不到
+
+
+def _check_missing_desc(fm_cache: list[dict]) -> list[str]:
+    return [f"{fm.get('namespace') or '(global)'}/{fm.get('name', fm['path'].stem)}"
+            for fm in fm_cache
+            if len((fm.get("description") or "").strip('"').strip("'").strip()) < _DESC_MIN_LEN]
+
+
 def _sensitive_scan(content: str) -> list[str]:
     matched = []
     for pat, label in SENSITIVE_PATTERNS:
@@ -626,46 +649,48 @@ def _detect_contradictions(fm_cache: list[dict]) -> list[dict]:
     return [c for c in contradictions if c.get("verdict") == "contradiction"]
 
 
+_COMPLETENESS_REQUIRED: dict[str, list[tuple]] = {
+    "_index": [
+        (r"(描述|简介|概述|是什么|what)", "项目描述"),
+        (r"(功能|能力|用途|负责|职责|负责|purpose)", "功能/用途"),
+    ],
+    "overview": [
+        (r"(范围|scope|组件|模块|入口|分层|component)", "范围/组件"),
+        (r"(流程|数据流|调用链|链路|拓扑|data.?flow)", "数据流/流程"),
+    ],
+    "deps": [
+        (r"(依赖|被.*?依赖|调用|使用|依赖方)", "依赖方"),
+        (r"(接口|API|端口|URL|endpoint|topic)", "接口"),
+        (r"(影响|后果|失败|不可用|断开|降级|如果.*?断)", "影响范围"),
+    ],
+    "design": [
+        (r"(原因|因为|由于|为了|所以|目的|动机|决策|背景|why)", "决策原因"),
+        (r"(方案|设计|架构|结构|替代|权衡|取舍|trade.?off|(选|否|放弃))", "方案/权衡"),
+        (r"(约束|局限|限制|前提|条件|取舍)", "约束条件"),
+        (r"(脆弱|薄弱|风险|弱点|易出问题)", "已知脆弱点"),
+    ],
+    "sop": [
+        (r"(后|之后|时|如果|当|在|一旦|每次|每当|触发)", "触发条件"),
+        (r"(原因|根因|因为|由于|导致|表现为|症状|报错|错误|返回)", "根因解释"),
+        (r"(验证|排查|检查|确认|判断|怎么|如何|诊断)", "诊断思路"),
+    ],
+}
+
+_SEG_PRIORITY = {"sop": 0, "deps": 1, "design": 2, "overview": 3, "_index": 4}
+
+
 def _check_completeness(fm_cache: list[dict], max_items: int = 10) -> list[dict]:
     """Check memory completeness, returning at most max_items results.
     Prioritizes by: 1) sop/deps/design (operational impact), 2) most missing elements."""
-    REQUIRED: dict[str, list[tuple]] = {
-        "_index": [
-            (r"(描述|简介|概述|是什么|what)", "项目描述"),
-            (r"(功能|能力|用途|负责|职责|负责|purpose)", "功能/用途"),
-        ],
-        "overview": [
-            (r"(范围|scope|组件|模块|入口|分层|component)", "范围/组件"),
-            (r"(流程|数据流|调用链|链路|拓扑|data.?flow)", "数据流/流程"),
-        ],
-        "deps": [
-            (r"(依赖|被.*?依赖|调用|使用|依赖方)", "依赖方"),
-            (r"(接口|API|端口|URL|endpoint|topic)", "接口"),
-            (r"(影响|后果|失败|不可用|断开|降级|如果.*?断)", "影响范围"),
-        ],
-        "design": [
-            (r"(原因|因为|由于|为了|所以|目的|动机|决策|背景|why)", "决策原因"),
-            (r"(方案|设计|架构|结构|替代|权衡|取舍|trade.?off|(选|否|放弃))", "方案/权衡"),
-            (r"(约束|局限|限制|前提|条件|取舍)", "约束条件"),
-            (r"(脆弱|薄弱|风险|弱点|易出问题)", "已知脆弱点"),
-        ],
-        "sop": [
-            (r"(后|之后|时|如果|当|在|一旦|每次|每当|触发)", "触发条件"),
-            (r"(原因|根因|因为|由于|导致|表现为|症状|报错|错误|返回)", "根因解释"),
-            (r"(验证|排查|检查|确认|判断|怎么|如何|诊断)", "诊断思路"),
-        ],
-    }
-
-    _SEG_PRIORITY = {"sop": 0, "deps": 1, "design": 2, "overview": 3, "_index": 4}
 
     results = []
     for fm in fm_cache:
         seg = fm.get("segment", "")
         body = fm.get("_body", "")
         name = fm.get("name", "")
-        if not body or seg not in REQUIRED:
+        if not body or seg not in _COMPLETENESS_REQUIRED:
             continue
-        missing = [label for pat, label in REQUIRED[seg]
+        missing = [label for pat, label in _COMPLETENESS_REQUIRED[seg]
                    if not re.search(pat, body, re.IGNORECASE)]
         if missing:
             results.append({"name": name, "ns": fm.get("namespace", ""),
@@ -972,6 +997,11 @@ def format_html(result: dict) -> str:
 
     parts.append(" | ".join(summary_parts))
 
+    audit_results = result.get("audit_results", [])
+    if not audit_results:
+        parts.append('<br><p style="font-size:12px;color:#636e72;margin:4px 0">'
+                     '本次仅做结构检查（L1），未运行 LLM 深度审计：内容质量、矛盾、完整性均未检查</p>')
+
     # ── by_domain distribution table (L1, no LLM needed) ──
     by_domain = stats.get("by_domain", {})
     if by_domain:
@@ -1005,8 +1035,8 @@ def format_html(result: dict) -> str:
             f'<tr><th>文件</th><th class="num">行数</th><th>建议</th></tr>{o_rows}</table>'
         )
 
-    audit_results = result.get("audit_results", [])
-    audit_errors = sum(1 for r in audit_results if "error" in r)
+    audit_errors_list = [r for r in audit_results if "error" in r]
+    audit_errors = len(audit_errors_list)
     audit_results = [r for r in audit_results if "error" not in r]
     flag_items = result.get("flag_items", [])
     consolidations = result.get("consolidations", [])
@@ -1016,8 +1046,18 @@ def format_html(result: dict) -> str:
     model_disagreements = result.get("model_disagreements", [])
 
     if audit_errors:
-        parts.insert(0, f'<p style="font-size:12px;color:#e17055;margin:2px 0">'
-                        f'审计未完成：{audit_errors} 条 LLM 调用失败，已排除</p>')
+        err_rows = "".join(
+            f'<tr><td class="mem-name">{r["file"][:30]}</td>'
+            f'<td style="font-size:11px;color:#636e72">{r["error"][:80]}</td></tr>\n'
+            for r in audit_errors_list
+        )
+        parts.append(
+            f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
+            f'审计失败 ({audit_errors}/{audit_errors + len(audit_results)} 条，结论未知)</div>'
+            f'<table class="data-table">'
+            f'<col style="width:35%"><col style="width:65%">'
+            f'<tr><th>文件</th><th>错误</th></tr>{err_rows}</table>'
+        )
 
     auto_items = [r for r in audit_results if r.get("action") in ("keep", "demote", None)]
 
@@ -1097,10 +1137,20 @@ def format_html(result: dict) -> str:
         )
         parts.append(
             f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
-            f'内容不完整 ({len(completeness_issues)} 条)</div>'
+            f'缺关键要素 ({len(completeness_issues)} 条)</div>'
             f'<table class="data-table">'
             f'<col style="width:30%"><col style="width:15%"><col style="width:55%">'
             f'<tr><th>文件</th><th>段</th><th>缺少要素</th></tr>{comp_rows}</table>'
+        )
+
+    missing_desc = result.get("missing_desc", [])
+    if missing_desc:
+        md_rows = "".join(f'<tr><td class="mem-name">{n[:60]}</td></tr>\n' for n in missing_desc[:12])
+        parts.append(
+            f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
+            f'缺 description ({len(missing_desc)} 条)</div>'
+            f'<table class="data-table"><col style="width:100%">'
+            f'<tr><th>文件</th></tr>{md_rows}</table>'
         )
 
     if path_issues:
@@ -1180,6 +1230,7 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         "completeness_issues": [],
         "path_issues": [],
         "model_disagreements": [],
+        "missing_desc": _check_missing_desc(fm_cache),
     }
 
     if llm_enabled:
