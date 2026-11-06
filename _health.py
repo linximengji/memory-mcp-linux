@@ -780,13 +780,18 @@ _COMPLETENESS_REQUIRED: dict[str, list[tuple]] = {
         (r"(原因|因为|由于|为了|所以|目的|动机|决策|背景|why)", "决策原因"),
         (r"(方案|设计|架构|结构|替代|权衡|取舍|trade.?off|(选|否|放弃))", "方案/权衡"),
         (r"(约束|局限|限制|前提|条件|取舍)", "约束条件"),
-        (r"(脆弱|薄弱|风险|弱点|易出问题)", "已知脆弱点"),
     ],
     "sop": [
         (r"(后|之后|时|如果|当|在|一旦|每次|每当|触发)", "触发条件"),
         (r"(原因|根因|因为|由于|导致|表现为|症状|报错|错误|返回)", "根因解释"),
         (r"(验证|排查|检查|确认|判断|怎么|如何|诊断)", "诊断思路"),
     ],
+}
+
+# 建议项：不计入完整性告警，只在实际写入时提示。design 的"已知脆弱点"多数记录不会写，
+# 若设为必须项会让 70% 以上的 design 记忆常年挂红，失去区分度
+_COMPLETENESS_ADVISORY = {
+    "design": [(r"(脆弱|薄弱|风险|弱点|易出问题)", "已知脆弱点")],
 }
 
 _SEG_PRIORITY = {"sop": 0, "deps": 1, "design": 2, "overview": 3, "_index": 4}
@@ -1422,6 +1427,7 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         result["consolidations"] = consolidations
         result["contradictions"] = contradictions
         result["completeness_issues"] = _check_completeness(fm_cache, max_items=10)
+        result["completeness_total"] = _count_completeness(fm_cache)
         result["path_issues"] = _verify_file_paths(fm_cache)
         result["model_disagreements"] = _multi_model_audit(fm_cache, flash_results=audit_results)
 
