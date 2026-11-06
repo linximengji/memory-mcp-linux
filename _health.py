@@ -37,8 +37,32 @@ SENSITIVE_PATTERNS = [
     (re.compile(r"\bsk-[a-zA-Z0-9]{20,}\b"), "api_key"),
     (re.compile(r"\bgh[opsu]_[a-zA-Z0-9]{16,}\b"), "github_token"),
     (re.compile(r"\b-----BEGIN (RSA )?PRIVATE KEY-----\b"), "private_key"),
-    (re.compile(r"https?://[^:]+:[^@]+@"), "url_creds"),
+    (re.compile(r"https?://[^/\s`]+:[^@\s`]+@"), "url_creds"),
+    (re.compile(r"(访问码|access[_ ]?code|password|密码)\s*[:：=]\s*`?[0-9A-Za-z]{6,}`?", re.I), "inline_password"),
 ]
+
+# _index 只放项目名片；这些词出现多次说明系统地图/决策/操作流程堆在了 _index
+_INDEX_OVERFLOW = {
+    "sop": re.compile(r"排查|诊断|报错|根因|症状|修复|修复|curl|操作步骤|执行|命令", re.I),
+    "deps": re.compile(r"依赖|接口|端口|topic", re.I),
+    "overview": re.compile(r"组件|数据流|模块", re.I),
+    "design": re.compile(r"决策|而非|取舍|权衡|trade", re.I),
+}
+_NAMESPACE_ALIASES = {"proxy": "model-proxy", "daily-report": "daily_report"}
+
+
+def _check_index_overflow(fm_cache: list[dict], threshold: int = 5) -> list[dict]:
+    out = []
+    for fm in fm_cache:
+        if fm.get("segment") != "_index":
+            continue
+        hits = {seg: len(pat.findall(fm.get("_body", ""))) for seg, pat in _INDEX_OVERFLOW.items()}
+        hits = {k: v for k, v in hits.items() if v >= threshold}
+        if hits:
+            out.append({"name": fm.get("name", ""), "ns": fm.get("namespace", ""),
+                        "chars": len(fm.get("_body", "")),
+                        "suggest": sorted(hits, key=hits.get, reverse=True)})
+    return out
 
 
 def _load_dismissed() -> set[str]:
@@ -77,6 +101,7 @@ def _parse_frontmatter(path: Path) -> dict | None:
     fm["namespace"] = fm.get("namespace", "")
     fm["segment"] = fm.get("segment", "_index")
     fm["name"] = fm.get("name", path.stem)
+    fm["description"] = fm.get("description", "").strip('"').strip("'").strip()
     fm["_created"] = datetime.fromtimestamp(path.stat().st_ctime)
     return fm
 
@@ -142,8 +167,74 @@ def _build_fm_cache() -> list[dict]:
         for f in sorted(ns_dir.glob("*.md")):
             fm = _parse_frontmatter(f)
             if fm:
+                fm["namespace"] = fm.get("namespace") or ns_dir.name
                 cache.append(fm)
     return cache
+
+
+def _check_ns_mismatch(fm_cache: list[dict]) -> list[dict]:
+    wrong = []
+    for fm in fm_cache:
+        declared = fm.get("namespace")
+        folder = fm["path"].parent.name
+        if declared and declared != folder:
+            wrong.append({"file": fm.get("name", ""), "declared": declared, "folder": folder})
+    return wrong
+
+
+def _fix_ns_mismatch(fm_cache: list[dict]) -> list[dict]:
+    """文件所在目录才是真 namespace（_storage 以目录为准），把 frontmatter 里写错的改回来。"""
+    fixed = []
+    for w in _check_ns_mismatch(fm_cache):
+        fm = next(f for f in fm_cache if f.get("name") == w["file"] and f["path"].parent.name == w["folder"])
+        raw = _read_file_safe(fm["path"])
+        new_raw, n = re.subn(rf"^namespace:\s*{re.escape(w['declared'])}\s*$",
+                             f"namespace: {w['folder']}", raw, count=1, flags=re.MULTILINE)
+        if n:
+            _atomic_write(fm["path"], new_raw)
+            fixed.append(w)
+    return fixed
+
+
+def _check_dup_frontmatter(fm_cache: list[dict]) -> list[dict]:
+    """正文开头又出现一个 frontmatter 块：多半是回填 description 时拼接出错，
+    块里的字段会被当成正文，召回和审计都会读错。"""
+    dups = []
+    for fm in fm_cache:
+        body_lines = [l.strip() for l in fm.get("_body", "").split("\n") if l.strip()]
+        if body_lines and body_lines[0] == "---":
+            dups.append({"file": fm["path"], "name": fm.get("name", ""), "ns": fm.get("namespace", "")})
+    return dups
+
+
+def _fix_dup_frontmatter(dups: list[dict]) -> int:
+    fixed = 0
+    for d in dups:
+        raw = _read_file_safe(d["file"])
+        m = FM_RE.match(raw)
+        if not m:
+            continue
+        body_lines = m.group(2).split("\n")
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        if not body_lines or body_lines[0].strip() != "---":
+            continue
+        extra, n = FM_RE.subn("", "\n".join(body_lines), count=1)
+        if not n:
+            continue
+        fields = {}
+        for block in (m.group(1), extra and FM_RE.match(extra).group(1)):
+            for line in (block or "").split("\n"):
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    if v.strip():
+                        fields[k.strip()] = v.strip()
+        order = ["description", "name", "namespace", "segment"]
+        fm_lines = [f"{k}: {fields[k]}" for k in order if k in fields]
+        fm_lines += [f"{k}: {v}" for k, v in fields.items() if k not in order]
+        _atomic_write(d["file"], "---\n" + "\n".join(fm_lines) + "\n---\n" + extra.lstrip("\n"))
+        fixed += 1
+    return fixed
 
 
 def _check_orphans(fm_cache: list[dict]) -> list[dict]:
@@ -173,10 +264,14 @@ def _check_broken_links(fm_cache: list[dict]) -> list[dict]:
     broken = []
     for fm in fm_cache:
         body = fm.get("_body", "")
-        for link in WIKI_RE.findall(body):
-            name = link.split("/")[-1].strip()
+        for raw_link in WIKI_RE.findall(body):
+            target, _, rel = raw_link.partition("|")
+            if rel.startswith("rel:"):
+                continue  # 跨项目关系链接目标可以不存在（项目未建模前）
+            name = target.split("/")[-1].strip()
             if name and name not in available:
-                broken.append({"file": fm.get("name", "?"), "link": name})
+                broken.append({"file": fm["path"], "name": fm.get("name", "?"),
+                               "ns": fm.get("namespace", ""), "link": name})
     return broken
 
 
@@ -195,16 +290,13 @@ def _cleanup_orphans(orphans: list[dict], max_age_hours: int = 24) -> list[dict]
 
 
 def _fix_broken_links(broken: list[dict], fm_cache: list[dict]) -> int:
-    cache_by_name = {fm["name"]: fm for fm in fm_cache}
-    by_file: dict[str, set[str]] = {}
+    # name 跨命名空间会重名（如各项目的 architecture），必须按文件路径定位
+    by_file: dict[Path, set[str]] = {}
     for b in broken:
         by_file.setdefault(b["file"], set()).add(b["link"])
     fixed = 0
-    for filename, links in by_file.items():
-        fm = cache_by_name.get(filename)
-        if not fm:
-            continue
-        raw = _read_file_safe(fm["path"])
+    for path, links in by_file.items():
+        raw = _read_file_safe(path)
         body_m = FM_RE.match(raw)
         if not body_m:
             continue
@@ -218,7 +310,7 @@ def _fix_broken_links(broken: list[dict], fm_cache: list[dict]) -> int:
         if new_body != body:
             prefix = raw[: body_m.start(2)]
             suffix = raw[body_m.end(2):]
-            _atomic_write(fm["path"], prefix + new_body + suffix)
+            _atomic_write(path, prefix + new_body + suffix)
             fixed += 1
     return fixed
 
@@ -250,16 +342,7 @@ def _compute_stats(fm_cache: list[dict]) -> dict:
 
 def _count_completeness(fm_cache: list[dict]) -> int:
     """Count all completeness findings (display shows only the top N). Same rules as _check_completeness."""
-    total = 0
-    for fm in fm_cache:
-        seg = fm.get("segment", "")
-        rules = _COMPLETENESS_REQUIRED.get(seg)
-        body = fm.get("_body", "")
-        if not rules or not body:
-            continue
-        if any(not re.search(pat, body, re.IGNORECASE) for pat, _ in rules):
-            total += 1
-    return total
+    return sum(1 for fm in fm_cache if _check_completeness([fm], max_items=1))
 
 
 _DESC_MIN_LEN = 8  # description 是召回的首要依据，空/占位描述等于这条记忆搜不到
@@ -268,7 +351,7 @@ _DESC_MIN_LEN = 8  # description 是召回的首要依据，空/占位描述等�
 def _check_missing_desc(fm_cache: list[dict]) -> list[str]:
     return [f"{fm.get('namespace') or '(global)'}/{fm.get('name', fm['path'].stem)}"
             for fm in fm_cache
-            if len((fm.get("description") or "").strip('"').strip("'").strip()) < _DESC_MIN_LEN]
+            if len(fm.get("description", "")) < _DESC_MIN_LEN]
 
 
 def _sensitive_scan(content: str) -> list[str]:
@@ -283,6 +366,9 @@ def _sensitive_scan(content: str) -> list[str]:
 
 def _check_segment_references(fm_cache: list[dict]) -> list[dict]:
     """Scan all memory files for stale segment references.
+
+    另查一类：文件名是段约定名（xxx-index.md / overview.md ...）但 segment 标成别的段——
+    按五段模型这些文件放错了段。
 
     Detects:
     - Deprecated segment names in body text (pitfalls, architecture, changelog)
@@ -325,6 +411,18 @@ def _check_segment_references(fm_cache: list[dict]) -> list[dict]:
                 "detail": f"body mentions deprecated segment '{m.group()}'",
             })
 
+        stem = fm["path"].stem
+        if stem.endswith("index"):
+            expects = "_index"
+        elif stem in ("overview", "deps", "design", "sop"):
+            expects = stem
+        else:
+            expects = None
+        if expects and segment != expects:
+            issues.append({"file": stem, "ns": ns, "segment": segment,
+                           "check": "stale_frontmatter",
+                           "detail": f"文件名约定为 {expects}，frontmatter 是 {segment}"})
+
         # Check body for stale numeric claims (skip audit-record comments)
         for m in count_pattern.finditer(body_clean):
             count = int(m.group(1))
@@ -336,6 +434,16 @@ def _check_segment_references(fm_cache: list[dict]) -> list[dict]:
                 })
 
     return issues
+def _check_ns_alias(fm_cache: list[dict]) -> list[dict]:
+    out = []
+    for ns in sorted({fm["path"].parent.name for fm in fm_cache if fm["path"].parent.name in _NAMESPACE_ALIASES}):
+        target = _NAMESPACE_ALIASES[ns]
+        if (MEMORY_DIR / target).is_dir():
+            out.append({"ns": ns, "target": target,
+                        "files": sum(1 for fm in fm_cache if fm["path"].parent.name == ns)})
+    return out
+
+
 def _build_segment_guide_text() -> str:
     """Build a compact segment definition string for LLM prompts."""
     return "\n".join(
@@ -460,7 +568,9 @@ def _deep_audit_entry(fm: dict, guide_text: str) -> dict:
 def _deep_audit(fm_cache: list[dict]) -> list[dict]:
     max_candidates = 15
     guide_text = _build_segment_guide_text()
-    candidates = sorted(fm_cache, key=lambda fm: _age_days(fm))[:max_candidates]
+    # 按最近修改时间轮转：每次审最新的一批，连续跑几天可覆盖全部记忆
+    # （原先按最旧优先，导致最新写入的记忆永远轮不到审计）
+    candidates = sorted(fm_cache, key=lambda fm: -fm["path"].stat().st_mtime)[:max_candidates]
     with ThreadPoolExecutor(max_workers=_LLM_WORKERS) as ex:
         return list(ex.map(_deep_audit_entry, candidates, [guide_text] * len(candidates)))
 
@@ -577,61 +687,64 @@ def _consolidation_pass(fm_cache: list[dict]) -> list[dict]:
     return results
 
 
-def _detect_contradictions(fm_cache: list[dict]) -> list[dict]:
-    ns_groups: dict[str, list[dict]] = {}
+_CONTRADICTION_STOP_WORDS = {"这个", "那个", "什么", "如何", "可以", "需要", "使用", "一个",
+                             "没有", "已经", "如果", "因为", "所以", "但是", "不是", "就是",
+                             "并且", "其中", "之后"}
+
+
+def _detect_contradictions(fm_cache: list[dict], max_pairs: int = 10, top_k: int = 3) -> list[dict]:
+    """候选按共享专业词加权排序：高频词降权，每个命名空间至少能进 top_k 对，
+    避免全局区几百个文件把候选名额占满、跨项目矛盾永远排不上。"""
+    entries = []
     for fm in fm_cache:
-        ns = fm.get("namespace", "(global)")
         body = _strip_audit(fm.get("_body", ""))
-        if not body or len(body) < 50:
+        if body and len(body) >= 50:
+            entries.append((fm, body))
+
+    df: Counter = Counter()
+    toks = []
+    for _, body in entries:
+        t = {w for w in re.split(r"[\s,　。.、/\-_:()\d]+", body)
+             if len(w) >= 3 and w not in _CONTRADICTION_STOP_WORDS}
+        toks.append(t)
+        df.update(t)
+
+    scored = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            overlap = toks[i] & toks[j]
+            if len(overlap) >= 2:
+                scored.append((sum(1.0 / df[w] for w in overlap), i, j, sorted(overlap)[:5]))
+    scored.sort(key=lambda x: -x[0])
+
+    picks = []
+    per_ns: Counter = Counter()
+    for _weight, i, j, kw in scored:
+        ns = entries[i][0].get("namespace", "")
+        if per_ns[ns] >= top_k:
             continue
-        ns_groups.setdefault(ns, []).append(fm)
-
-    candidates = []
-    STOP_WORDS = {"这个", "那个", "什么", "如何",
-                  "可以", "需要", "使用", "一个",
-                  "没有", "已经", "如果", "因为",
-                  "所以", "但是", "不是", "就是",
-                  "并且", "其中", "之后"}
-
-    for ns, entries in ns_groups.items():
-        names = [e["name"] for e in entries if e.get("name")]
-        bodies_dict = {}
-        for e in entries:
-            bodies_dict[e["name"]] = _strip_audit(e.get("_body", ""))
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                a, b = names[i], names[j]
-                tokens_a = {t for t in re.split(r"[\s,　。.、/\-_:()\d]+",
-                                                bodies_dict.get(a, ""))
-                            if len(t) >= 3 and t not in STOP_WORDS}
-                tokens_b = {t for t in re.split(r"[\s,　。.、/\-_:()\d]+",
-                                                bodies_dict.get(b, ""))
-                            if len(t) >= 3 and t not in STOP_WORDS}
-                overlap = tokens_a & tokens_b
-                if len(overlap) >= 2:
-                    candidates.append((ns, a, b, list(overlap)[:5]))
-
-    if not candidates:
+        per_ns[ns] += 1
+        picks.append((ns, entries[i][0], entries[j][0], kw))
+        if len(picks) >= max_pairs:
+            break
+    if not picks:
         return []
-
-    candidates.sort(key=lambda x: -len(x[3]))
-    candidates = candidates[:10]
 
     prompt_lines = [
         "You are a memory contradiction auditor. Review each candidate pair.",
-        "Two entries in the same namespace may CONTRADICT each other.",
+        "The two entries in each pair may STATE OPPOSITE THINGS about the same fact",
+        "(same component, same config key, same behavior). Judges only actual conflicts;",
+        "different topics sharing words are not contradictions.",
         'Reply JSON array: [{"source":"name1","target":"name2","topic":"...",',
         '"claim1":"...","claim2":"...","verdict":"contradiction|consistent"}]',
         "",
     ]
-    for ns, a, b, kw in candidates:
-        fm_a = next((fm for fm in fm_cache if fm["name"] == a), {})
-        fm_b = next((fm for fm in fm_cache if fm["name"] == b), {})
+    for ns, fm_a, fm_b, _kw in picks:
         body_a = _strip_audit(fm_a.get("_body", ""))[:800]
         body_b = _strip_audit(fm_b.get("_body", ""))[:800]
-        prompt_lines.append(f"--- ns={ns} ---")
-        prompt_lines.append(f"Entry A [{a}]: {body_a}")
-        prompt_lines.append(f"Entry B [{b}]: {body_b}")
+        prompt_lines.append(f"--- ns={ns or '(全局)'} ---")
+        prompt_lines.append(f"Entry A [{fm_a['name']}]: {body_a}")
+        prompt_lines.append(f"Entry B [{fm_b['name']}]: {body_b}")
         prompt_lines.append("")
 
     reply = _call_llm("\n".join(prompt_lines), max_tokens=800, temperature=0.2, timeout=60)
@@ -692,6 +805,12 @@ def _check_completeness(fm_cache: list[dict], max_items: int = 10) -> list[dict]
             continue
         missing = [label for pat, label in _COMPLETENESS_REQUIRED[seg]
                    if not re.search(pat, body, re.IGNORECASE)]
+        if seg == "_index":
+            # 项目名片的一句话定义通常写在 description 里（正文可能只有索引列表），合起来判断
+            desc = fm.get("description", "")
+            missing = [lab for lab in missing
+                       if not re.search(dict((l, p) for p, l in _COMPLETENESS_REQUIRED[seg])[lab],
+                                        desc, re.IGNORECASE)]
         if missing:
             results.append({"name": name, "ns": fm.get("namespace", ""),
                             "segment": seg, "missing_elements": missing,
@@ -995,7 +1114,24 @@ def format_html(result: dict) -> str:
     elif broken:
         summary_parts.append(f'<span class="tag-info">{len(broken)} 个损坏链接</span>')
 
+    for seg in result.get("segment_refs", []):
+        if seg.get("check") == "stale_frontmatter":
+            summary_parts.append(f'<span class="tag-warn">段与文件名不符 {seg["ns"]}/{seg["file"]}</span>')
     parts.append(" | ".join(summary_parts))
+
+    for a in result.get("ns_alias", []):
+        parts.append(f'<br><p style="font-size:12px;color:#e17055;margin:4px 0">'
+                     f'命名空间 {a["ns"]}/ 与 {a["target"]}/ 并存（{a["files"]} 个文件），应合并到 {a["target"]}/</p>')
+
+    sensitive = result.get("sensitive", [])
+    if sensitive:
+        s_rows = "".join(f'<tr><td class="mem-name">{s["ns"]}/{s["name"]}</td>'
+                         f'<td style="font-size:12px;color:#d63031">{"、".join(s["kinds"])}</td></tr>\n'
+                         for s in sensitive[:12])
+        parts.append(f'<br><div style="font-size:12px;font-weight:700;color:#d63031;margin-top:8px">'
+                     f'疑似明文凭据 ({len(sensitive)} 条)</div>'
+                     f'<table class="data-table"><col style="width:60%"><col style="width:40%">'
+                     f'<tr><th>文件</th><th>类型</th></tr>{s_rows}</table>')
 
     audit_results = result.get("audit_results", [])
     if not audit_results:
@@ -1016,6 +1152,15 @@ def format_html(result: dict) -> str:
             f'<col style="width:70%"><col style="width:30%" class="num">'
             f'<tr><th>段</th><th class="num">文件数</th></tr>{dom_rows}</table>'
         )
+
+    seg_count: Counter = Counter()
+    for seg, count in by_domain.items():
+        seg_count[seg.split("/")[-1]] += count
+    parts.append(
+        '<br><p style="font-size:12px;color:#636e72;margin:4px 0">段合计：'
+        + " | ".join(f"{seg} {seg_count[seg]}" for seg in ("_index", "overview", "deps", "design", "sop"))
+        + f'</p>'
+    )
 
     # ── oversized files (L1) ──
     oversized = stats.get("oversized", [])
@@ -1137,10 +1282,28 @@ def format_html(result: dict) -> str:
         )
         parts.append(
             f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
-            f'缺关键要素 ({len(completeness_issues)} 条)</div>'
+            f'缺关键要素 ({len(completeness_issues)} 条'
+            + (f'，共 {result.get("completeness_total", 0)} 条' if result.get("completeness_total", 0) > len(completeness_issues) else '')
+            + ')</div>'
             f'<table class="data-table">'
             f'<col style="width:30%"><col style="width:15%"><col style="width:55%">'
             f'<tr><th>文件</th><th>段</th><th>缺少要素</th></tr>{comp_rows}</table>'
+        )
+
+    overflow = result.get("index_overflow", [])
+    if overflow:
+        o_rows = "".join(
+            f'<tr><td class="mem-name">{o["ns"]}/{o["name"]}</td>'
+            f'<td style="font-size:12px;color:#636e72">{o["chars"]} 字</td>'
+            f'<td style="font-size:12px;color:#e17055">{"、".join(o["suggest"])}</td></tr>\n'
+            for o in overflow[:12]
+        )
+        parts.append(
+            f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
+            f'_index 内容溢出 ({len(overflow)} 条)</div>'
+            f'<table class="data-table">'
+            f'<col style="width:40%"><col style="width:15%"><col style="width:45%">'
+            f'<tr><th>文件</th><th>篇幅</th><th>建议迁往</th></tr>{o_rows}</table>'
         )
 
     missing_desc = result.get("missing_desc", [])
@@ -1210,11 +1373,15 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         return {"error": "memory directory not found", "stats": {}}
 
     stats = _compute_stats(fm_cache)
+    dup_fixed = _fix_dup_frontmatter(_check_dup_frontmatter(fm_cache))
+    if dup_fixed:
+        fm_cache = _build_fm_cache()
     orphans = _check_orphans(fm_cache)
     broken = _check_broken_links(fm_cache)
     cleaned = _cleanup_orphans(orphans)
     fixed_links = _fix_broken_links(broken, fm_cache)
     segment_refs = _check_segment_references(fm_cache)
+    ns_alias = _check_ns_alias(fm_cache)
 
     result: dict[str, Any] = {
         "stats": stats,
@@ -1231,6 +1398,13 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         "path_issues": [],
         "model_disagreements": [],
         "missing_desc": _check_missing_desc(fm_cache),
+        "ns_alias": ns_alias,
+        "index_overflow": _check_index_overflow(fm_cache),
+        "completeness_total": _count_completeness(fm_cache),
+        "sensitive": [{"name": fm.get("name", ""), "ns": fm.get("namespace") or fm["path"].parent.name,
+                       "kinds": _sensitive_scan(_strip_audit(fm.get("_body", "")))}
+                      for fm in fm_cache if _sensitive_scan(_strip_audit(fm.get("_body", "")))],
+        "fixed_frontmatter": dup_fixed,
     }
 
     if llm_enabled:
