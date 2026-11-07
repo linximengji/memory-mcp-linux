@@ -1122,6 +1122,8 @@ def format_html(result: dict) -> str:
     for seg in result.get("segment_refs", []):
         if seg.get("check") == "stale_frontmatter":
             summary_parts.append(f'<span class="tag-warn">段与文件名不符 {seg["ns"]}/{seg["file"]}</span>')
+    if not result.get("audit_results"):
+        summary_parts.append('<span style="font-size:11px;color:#b2bec3">未跑 LLM 深度审计</span>')
     parts.append(" | ".join(summary_parts))
 
     for a in result.get("ns_alias", []):
@@ -1139,33 +1141,23 @@ def format_html(result: dict) -> str:
                      f'<tr><th>文件</th><th>类型</th></tr>{s_rows}</table>')
 
     audit_results = result.get("audit_results", [])
-    if not audit_results:
-        parts.append('<br><p style="font-size:12px;color:#636e72;margin:4px 0">'
-                     '本次仅做结构检查（L1），未运行 LLM 深度审计：内容质量、矛盾、完整性均未检查</p>')
 
-    # ── by_domain distribution table (L1, no LLM needed) ──
+    # ── segment distribution: 按段汇总，再列文件数最多的项目 ──
     by_domain = stats.get("by_domain", {})
     if by_domain:
-        dom_rows = "".join(
-            f'<tr><td>{seg}</td><td class="num">{count}</td></tr>\n'
-            for seg, count in sorted(by_domain.items(), key=lambda x: -x[1])
-        )
+        seg_count: Counter = Counter()
+        ns_total: Counter = Counter()
+        for dom, count in by_domain.items():
+            ns, _, seg = dom.partition("/")
+            seg_count[seg] += count
+            ns_total[ns] += count
+        seg_line = " | ".join(f"{s} {seg_count[s]}" for s in ("_index", "overview", "deps", "design", "sop") if seg_count[s])
+        top_ns = "、".join(f"{ns} {n}" for ns, n in ns_total.most_common(5))
         parts.append(
-            f'<br><div style="font-size:12px;font-weight:700;color:#2d3436;margin-top:8px">'
-            f'段分布</div>'
-            f'<table class="data-table">'
-            f'<col style="width:70%"><col style="width:30%" class="num">'
-            f'<tr><th>段</th><th class="num">文件数</th></tr>{dom_rows}</table>'
+            f'<br><div style="font-size:12px;font-weight:700;color:#2d3436;margin-top:8px">段分布</div>'
+            f'<div style="font-size:12px;color:#636e72;margin:2px 0">{seg_line}</div>'
+            f'<div style="font-size:11px;color:#b2bec3">最多：{top_ns}</div>'
         )
-
-    seg_count: Counter = Counter()
-    for seg, count in by_domain.items():
-        seg_count[seg.split("/")[-1]] += count
-    parts.append(
-        '<br><p style="font-size:12px;color:#636e72;margin:4px 0">段合计：'
-        + " | ".join(f"{seg} {seg_count[seg]}" for seg in ("_index", "overview", "deps", "design", "sop"))
-        + f'</p>'
-    )
 
     # ── oversized files (L1) ──
     oversized = stats.get("oversized", [])
