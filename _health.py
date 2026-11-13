@@ -340,11 +340,6 @@ def _compute_stats(fm_cache: list[dict]) -> dict:
     }
 
 
-def _count_completeness(fm_cache: list[dict]) -> int:
-    """Count all completeness findings (display shows only the top N). Same rules as _check_completeness."""
-    return sum(1 for fm in fm_cache if _check_completeness([fm], max_items=1))
-
-
 _DESC_MIN_LEN = 8  # description 是召回的首要依据，空/占位描述等于这条记忆搜不到
 
 
@@ -762,68 +757,99 @@ def _detect_contradictions(fm_cache: list[dict], max_pairs: int = 10, top_k: int
     return [c for c in contradictions if c.get("verdict") == "contradiction"]
 
 
-_COMPLETENESS_REQUIRED: dict[str, list[tuple]] = {
-    "_index": [
-        (r"(描述|简介|概述|是什么|what)", "项目描述"),
-        (r"(功能|能力|用途|负责|职责|负责|purpose)", "功能/用途"),
-    ],
-    "overview": [
-        (r"(范围|scope|组件|模块|入口|分层|component)", "范围/组件"),
-        (r"(流程|数据流|调用链|链路|拓扑|data.?flow)", "数据流/流程"),
-    ],
-    "deps": [
-        (r"(依赖|被.*?依赖|调用|使用|依赖方)", "依赖方"),
-        (r"(接口|API|端口|URL|endpoint|topic)", "接口"),
-        (r"(影响|后果|失败|不可用|断开|降级|如果.*?断)", "影响范围"),
-    ],
-    "design": [
-        (r"(原因|因为|由于|为了|所以|目的|动机|决策|背景|why)", "决策原因"),
-        (r"(方案|设计|架构|结构|替代|权衡|取舍|trade.?off|(选|否|放弃))", "方案/权衡"),
-        (r"(约束|局限|限制|前提|条件|取舍)", "约束条件"),
-    ],
-    "sop": [
-        (r"(后|之后|时|如果|当|在|一旦|每次|每当|触发)", "触发条件"),
-        (r"(原因|根因|因为|由于|导致|表现为|症状|报错|错误|返回)", "根因解释"),
-        (r"(验证|排查|检查|确认|判断|怎么|如何|诊断)", "诊断思路"),
-    ],
+_SEG_SPECS = {
+    "_index": ("项目名片：一句话说清项目是什么、解决什么、什么场景用",
+               "是否说明了项目本质或它解决什么问题"),
+    "overview": ("系统地图：入口、核心流程、组件与数据流",
+                 "是否画出入口/主要流程/组件关系"),
+    "deps": ("依赖映射：谁依赖谁、接口在哪、断了会怎样",
+             "是否说清依赖方、接口，以及依赖断开的影响"),
+    "design": ("决策记录：选了 A 否了 B + 原因 + 已知脆弱点",
+               "是否说清了为什么这么选、放弃了什么"),
+    "sop": ("方法论：触发条件 → 排查怎么做 → 根因 → 误判后果",
+            "是否给出了可复用的判断方法或操作顺序"),
 }
 
-# 建议项：不计入完整性告警，只在实际写入时提示。design 的"已知脆弱点"多数记录不会写，
-# 若设为必须项会让 70% 以上的 design 记忆常年挂红，失去区分度
-_COMPLETENESS_ADVISORY = {
-    "design": [(r"(脆弱|薄弱|风险|弱点|易出问题)", "已知脆弱点")],
-}
-
-_SEG_PRIORITY = {"sop": 0, "deps": 1, "design": 2, "overview": 3, "_index": 4}
+_COMPLETENESS_STATE = MEMORY_DIR / ".completeness_state.json"
+_COMPLETENESS_WORKERS = 4
 
 
-def _check_completeness(fm_cache: list[dict], max_items: int = 10) -> list[dict]:
-    """Check memory completeness, returning at most max_items results.
-    Prioritizes by: 1) sop/deps/design (operational impact), 2) most missing elements."""
+def _check_completeness(fm_cache: list[dict]) -> dict:
+    """完整性用 LLM 判定，只判上次判定后新增或修改过的记忆。
 
-    results = []
+    关键词匹配会把"开头一句定义"判成缺项目描述，误报太多，已废弃。
+    判定结果按文件 mtime 缓存，未变动的文件不再重复调用。
+    """
+    state = {}
+    if _COMPLETENESS_STATE.exists():
+        try:
+            state = json.loads(_COMPLETENESS_STATE.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            state = {}
+
+    todo = []
     for fm in fm_cache:
-        seg = fm.get("segment", "")
-        body = fm.get("_body", "")
-        name = fm.get("name", "")
-        if not body or seg not in _COMPLETENESS_REQUIRED:
+        if fm.get("segment") not in _SEG_SPECS:
             continue
-        missing = [label for pat, label in _COMPLETENESS_REQUIRED[seg]
-                   if not re.search(pat, body, re.IGNORECASE)]
-        if seg == "_index":
-            # 项目名片的一句话定义通常写在 description 里（正文可能只有索引列表），合起来判断
-            desc = fm.get("description", "")
-            missing = [lab for lab in missing
-                       if not re.search(dict((l, p) for p, l in _COMPLETENESS_REQUIRED[seg])[lab],
-                                        desc, re.IGNORECASE)]
-        if missing:
-            results.append({"name": name, "ns": fm.get("namespace", ""),
-                            "segment": seg, "missing_elements": missing,
-                            "check": "completeness"})
+        key = str(fm["path"])
+        if state.get(key, {}).get("mtime") == fm["path"].stat().st_mtime:
+            continue
+        todo.append(fm)
 
-    results.sort(key=lambda r: (_SEG_PRIORITY.get(r["segment"], 9),
-                                -len(r["missing_elements"])))
-    return results[:max_items]
+    with ThreadPoolExecutor(max_workers=_COMPLETENESS_WORKERS) as ex:
+        verdicts = list(ex.map(_completeness_entry, todo))
+
+    for fm, v in zip(todo, verdicts):
+        state[str(fm["path"])] = {"mtime": fm["path"].stat().st_mtime, **v}
+    try:
+        _atomic_write(_COMPLETENESS_STATE, json.dumps(state, ensure_ascii=False, indent=1))
+    except OSError:
+        pass
+
+    issues, undetermined = [], 0
+    for fm in fm_cache:
+        v = state.get(str(fm["path"]))
+        if not v:
+            continue
+        if v.get("verdict") == "error":
+            undetermined += 1
+        elif v.get("verdict") == "incomplete":
+            issues.append({"name": fm.get("name", ""),
+                           "ns": fm.get("namespace") or fm["path"].parent.name,
+                           "segment": fm.get("segment", ""),
+                           "missing_elements": [v.get("missing", "")],
+                           "check": "completeness"})
+
+    issues.sort(key=lambda r: (r["ns"], r["segment"], r["name"]))
+    return {"issues": issues, "undetermined": undetermined,
+            "judged": len(state), "new": len(todo)}
+
+
+def _completeness_entry(fm: dict) -> dict:
+    seg = fm.get("segment", "")
+    spec, question = _SEG_SPECS[seg]
+    prompt = (
+        "你在审核一条记忆是否够格放在它所属的段里。\n"
+        f"段定义：{spec}\n"
+        f"判断：{question}\n\n"
+        f"记忆名：{fm.get('name', '')}\n"
+        f"描述：{fm.get('description', '') or '（无）'}\n"
+        f"正文：\n{_strip_audit(fm.get('_body', ''))[:1500]}\n\n"
+        '只回 JSON：{"verdict":"complete|incomplete","missing":"不完整时缺什么，一句话"}'
+    )
+    reply = _call_llm(prompt, max_tokens=120, temperature=0.1, timeout=45)
+    if reply.startswith("__LLM_ERROR__"):
+        return {"verdict": "error"}
+    m = re.search(r"\{.*?\}", reply, re.DOTALL)
+    if not m:
+        return {"verdict": "error"}
+    try:
+        parsed = json.loads(m.group())
+    except json.JSONDecodeError:
+        return {"verdict": "error"}
+    if parsed.get("verdict") == "incomplete":
+        return {"verdict": "incomplete", "missing": (parsed.get("missing") or "")[:80]}
+    return {"verdict": "complete"}
 
 
 _CONFIG_FILES = [
@@ -1279,9 +1305,12 @@ def format_html(result: dict) -> str:
         )
         parts.append(
             f'<br><div style="font-size:12px;font-weight:700;color:#e17055;margin-top:8px">'
-            f'缺关键要素 ({len(completeness_issues)} 条'
-            + (f'，共 {result.get("completeness_total", 0)} 条' if result.get("completeness_total", 0) > len(completeness_issues) else '')
+            f'完整性不符 ({len(completeness_issues)} 条'
+            + (f'，{result["completeness_undetermined"]} 条判定失败' if result.get("completeness_undetermined") else '')
             + ')</div>'
+            f'<div style="font-size:11px;color:#b2bec3;margin-bottom:2px">'
+            f'已判定 {result.get("completeness_judged", 0)} 条'
+            f'，本次新判 {result.get("completeness_new", 0)} 条（LLM 语义判定）</div>'
             f'<table class="data-table">'
             f'<col style="width:30%"><col style="width:15%"><col style="width:55%">'
             f'<tr><th>文件</th><th>段</th><th>缺少要素</th></tr>{comp_rows}</table>'
@@ -1392,12 +1421,14 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         "consolidations": [],
         "contradictions": [],
         "completeness_issues": [],
+        "completeness_undetermined": 0,
+        "completeness_judged": 0,
+        "completeness_new": 0,
         "path_issues": [],
         "model_disagreements": [],
         "missing_desc": _check_missing_desc(fm_cache),
         "ns_alias": ns_alias,
         "index_overflow": _check_index_overflow(fm_cache),
-        "completeness_total": _count_completeness(fm_cache),
         "sensitive": [{"name": fm.get("name", ""), "ns": fm.get("namespace") or fm["path"].parent.name,
                        "kinds": _sensitive_scan(_strip_audit(fm.get("_body", "")))}
                       for fm in fm_cache if _sensitive_scan(_strip_audit(fm.get("_body", "")))],
@@ -1418,8 +1449,11 @@ def run_memory_health(llm_enabled: bool = False) -> dict:
         result["flag_items"] = [r for r in audit_results if r.get("action") == "flag"]
         result["consolidations"] = consolidations
         result["contradictions"] = contradictions
-        result["completeness_issues"] = _check_completeness(fm_cache, max_items=10)
-        result["completeness_total"] = _count_completeness(fm_cache)
+        comp = _check_completeness(fm_cache)
+        result["completeness_issues"] = comp["issues"]
+        result["completeness_undetermined"] = comp["undetermined"]
+        result["completeness_judged"] = comp["judged"]
+        result["completeness_new"] = comp["new"]
         result["path_issues"] = _verify_file_paths(fm_cache)
         result["model_disagreements"] = _multi_model_audit(fm_cache, flash_results=audit_results)
 
